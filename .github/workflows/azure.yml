@@ -1,0 +1,182 @@
+name: Validate and deploy inference apps
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Test and compile
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install and test
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+          npm test
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
+          npm run check
+          if ($LASTEXITCODE -ne 0) { throw 'Type checking failed' }
+      - name: Compile infrastructure without Azure credentials
+        run: |
+          az bicep install
+          if ($LASTEXITCODE -ne 0) { throw 'Bicep installation failed' }
+          az bicep build --file .\infra\bootstrap.bicep
+          if ($LASTEXITCODE -ne 0) { throw 'Bootstrap compilation failed' }
+          az bicep build --file .\infra\main.bicep
+          if ($LASTEXITCODE -ne 0) { throw 'App compilation failed' }
+          $env:ACA_ENVIRONMENT = 'ci-environment'
+          $env:AZURE_LOCATION = 'westus3'
+          $env:ACR_NAME = 'ciregistry'
+          $env:GPU_PROFILE_NAME = 'gpu'
+          $env:GATEWAY_IMAGE = 'example.azurecr.io/gateway@sha256:' + ('a' * 64)
+          $env:MODEL_IMAGE = 'ghcr.io/ggml-org/llama.cpp@sha256:' + ('b' * 64)
+          $env:GATEWAY_API_KEY = 'ci-only-not-a-secret-client-' + ('a' * 32)
+          $env:BACKEND_API_KEY = 'ci-only-not-a-secret-backend-' + ('b' * 32)
+          az bicep build-params --file .\infra\main.bicepparam
+          if ($LASTEXITCODE -ne 0) { throw 'Parameter compilation failed' }
+
+  deploy:
+    name: Deploy gateway and model
+    needs: validate
+    if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    environment: production
+    concurrency:
+      group: inference-production-deployment
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+      ACA_ENVIRONMENT: ${{ vars.ACA_ENVIRONMENT }}
+      ACR_NAME: ${{ vars.ACR_NAME }}
+      GPU_PROFILE_NAME: ${{ vars.GPU_PROFILE_NAME }}
+      MODEL_IMAGE: ${{ vars.MODEL_IMAGE }}
+      DEPLOYMENT_REVISION: gh-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      - name: Validate deployment settings
+        env:
+          GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
+          BACKEND_API_KEY: ${{ secrets.BACKEND_API_KEY }}
+        run: |
+          foreach ($name in @('AZURE_RESOURCE_GROUP', 'ACA_ENVIRONMENT', 'ACR_NAME', 'GPU_PROFILE_NAME', 'MODEL_IMAGE')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Missing production variable: $name"
+            }
+          }
+          if ($env:MODEL_IMAGE -cnotmatch '^ghcr\.io/ggml-org/llama\.cpp@sha256:[a-f0-9]{64}$') {
+            throw 'MODEL_IMAGE must pin the official llama.cpp CUDA server image by digest'
+          }
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          $env:BACKEND_URL = 'https://model.invalid'
+          node --input-type=module -e "import { loadConfig } from './dist/src/config.js'; loadConfig(process.env);"
+          if ($LASTEXITCODE -ne 0) { throw 'API key configuration is invalid' }
+      - uses: azure/login@eec3c95657c1536435858eda1f3ff5437fee8474 # v2.3.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Check existing environment and workload profiles
+        run: |
+          az extension add --name containerapp --upgrade --only-show-errors
+          if ($LASTEXITCODE -ne 0) { throw 'Container Apps extension installation failed' }
+          az bicep install
+          if ($LASTEXITCODE -ne 0) { throw 'Bicep installation failed' }
+          $raw = az containerapp env show --name $env:ACA_ENVIRONMENT --resource-group $env:AZURE_RESOURCE_GROUP -o json --only-show-errors
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read Container Apps environment' }
+          $environment = $raw | ConvertFrom-Json
+          $gpu = @($environment.properties.workloadProfiles | Where-Object {
+            $_.name -eq $env:GPU_PROFILE_NAME -and $_.workloadProfileType -eq 'Consumption-GPU-NC24-A100'
+          })
+          $cpu = @($environment.properties.workloadProfiles | Where-Object {
+            $_.name -eq 'Consumption' -and $_.workloadProfileType -eq 'Consumption'
+          })
+          if ($gpu.Count -ne 1 -or $cpu.Count -ne 1) {
+            throw 'The configured serverless A100 profile and CPU Consumption profile must both exist'
+          }
+          if ([string]::IsNullOrWhiteSpace($environment.location)) { throw 'Environment region is missing' }
+          "AZURE_LOCATION=$($environment.location)" >> $env:GITHUB_ENV
+      - name: Build gateway in ACR and resolve immutable digest
+        run: |
+          $imageTag = "inference-gateway:$env:GITHUB_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          az acr build --registry $env:ACR_NAME --image $imageTag --file Dockerfile --platform linux/amd64 . --only-show-errors
+          if ($LASTEXITCODE -ne 0) { throw 'Gateway container build failed' }
+          $server = az acr show --name $env:ACR_NAME --query loginServer -o tsv --only-show-errors
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve registry server' }
+          $digest = az acr repository show --name $env:ACR_NAME --image $imageTag --query digest -o tsv --only-show-errors
+          if ($LASTEXITCODE -ne 0 -or $digest -cnotmatch '^sha256:[a-f0-9]{64}$') {
+            throw 'Cannot resolve gateway image digest'
+          }
+          "GATEWAY_IMAGE=$server/inference-gateway@$digest" >> $env:GITHUB_ENV
+      - name: Deploy both apps with secure parameters
+        env:
+          GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
+          BACKEND_API_KEY: ${{ secrets.BACKEND_API_KEY }}
+        run: |
+          $name = "inference-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          az deployment group validate --resource-group $env:AZURE_RESOURCE_GROUP --parameters .\infra\main.bicepparam --only-show-errors --output none
+          if ($LASTEXITCODE -ne 0) { throw 'Azure deployment validation failed' }
+          $baseUrl = az deployment group create --name $name --resource-group $env:AZURE_RESOURCE_GROUP --parameters .\infra\main.bicepparam --query properties.outputs.gatewayBaseUrl.value -o tsv --only-show-errors
+          if ($LASTEXITCODE -ne 0 -or $baseUrl -notmatch '^https://[^/]+/v1$') {
+            throw 'App deployment failed or returned no gateway URL'
+          }
+          "GATEWAY_BASE_URL=$baseUrl" >> $env:GITHUB_ENV
+      - name: Verify deployed boundaries and revisions
+        run: |
+          foreach ($name in @('qwen-gateway', 'qwen-model')) {
+            $raw = az containerapp show --name $name --resource-group $env:AZURE_RESOURCE_GROUP -o json --only-show-errors
+            if ($LASTEXITCODE -ne 0) { throw "Cannot inspect $name" }
+            $app = $raw | ConvertFrom-Json
+            $expectedExternal = $name -eq 'qwen-gateway'
+            if ($app.properties.configuration.ingress.external -ne $expectedExternal -or $app.properties.configuration.ingress.allowInsecure -ne $false) {
+              throw "Unexpected ingress configuration on $name"
+            }
+            if ($app.properties.template.scale.minReplicas -ne 0 -or $app.properties.template.scale.maxReplicas -ne 1) {
+              throw "Unexpected replica limits on $name"
+            }
+            $expectedRevision = "$name--$env:DEPLOYMENT_REVISION"
+            if ($app.properties.latestReadyRevisionName -ne $expectedRevision) {
+              throw "New revision of $name is not ready; inspect its logs"
+            }
+          }
+      - name: Smoke test the gateway without inference
+        env:
+          GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
+        run: |
+          node .\scripts\smoke.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Gateway smoke tests failed' }
+          "### Deployment verified" >> $env:GITHUB_STEP_SUMMARY
+          "Gateway base URL: $env:GATEWAY_BASE_URL" >> $env:GITHUB_STEP_SUMMARY
+          "Gateway image: $env:GATEWAY_IMAGE" >> $env:GITHUB_STEP_SUMMARY
+          "Model image: $env:MODEL_IMAGE" >> $env:GITHUB_STEP_SUMMARY
+          "Health, local discovery, and rejected-auth checks passed. No inference request was sent." >> $env:GITHUB_STEP_SUMMARY
