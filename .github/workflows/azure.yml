@@ -241,7 +241,7 @@ jobs:
           node .\scripts\smoke.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Gateway smoke tests failed' }
           "### Gateway checks passed" >> $env:GITHUB_STEP_SUMMARY
-          "Gateway base URL: $env:GATEWAY_BASE_URL" >> $env:GITHUB_STEP_SUMMARY
+          "Gateway base URL: not shown, because run summaries are public in public repositories. To print it, run ``az containerapp show --name qwen-gateway --resource-group <resource-group> --query properties.configuration.ingress.fqdn -o tsv`` and append ``/v1``." >> $env:GITHUB_STEP_SUMMARY
           "Gateway image: $env:GATEWAY_IMAGE" >> $env:GITHUB_STEP_SUMMARY
           "Model image: $env:MODEL_IMAGE" >> $env:GITHUB_STEP_SUMMARY
           "Health, local discovery, and rejected-auth checks passed. No inference request was sent." >> $env:GITHUB_STEP_SUMMARY

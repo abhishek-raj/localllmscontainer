@@ -522,8 +522,11 @@ model revision** is active, reports `Healthy`, and has a running replica.
 the model has loaded. Warmup and revision polling each have a nine-minute bound;
 the combined step has a 20-minute hard limit.
 
-The Actions summary contains the gateway base URL and both image digests, not
-keys. No inference request is sent, but **full deployments now deliberately wake
+The Actions summary contains both image digests but not the gateway base URL or
+keys, because run summaries are publicly readable in public repositories. Get
+the URL with
+`az containerapp show --name qwen-gateway --resource-group <resource-group> --query properties.configuration.ingress.fqdn -o tsv`
+and append `/v1`. No inference request is sent, but **full deployments now deliberately wake
 the GPU to verify startup**, followed by the billable idle cooldown. Bootstrap-only
 still skips this check. A failed check does not disable scale-to-zero or leave
 a minimum-one override; it also does not immediately stop an existing replica.
