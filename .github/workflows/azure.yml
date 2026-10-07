@@ -38,6 +38,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
           npm run check
           if ($LASTEXITCODE -ne 0) { throw 'Type checking failed' }
+          & .\scripts\test-acr-build.ps1
       - name: Compile infrastructure without Azure credentials
         run: |
           az bicep install
@@ -189,16 +190,9 @@ jobs:
       - name: Build gateway in ACR and resolve immutable digest
         if: ${{ !inputs.bootstrap_only }}
         run: |
-          $imageTag = "inference-gateway:$env:GITHUB_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          az acr build --registry $env:ACR_NAME --image $imageTag --file Dockerfile --platform linux/amd64 . --only-show-errors
-          if ($LASTEXITCODE -ne 0) { throw 'Gateway container build failed' }
-          $server = az acr show --name $env:ACR_NAME --query loginServer -o tsv --only-show-errors
-          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve registry server' }
-          $digest = az acr repository show --name $env:ACR_NAME --image $imageTag --query digest -o tsv --only-show-errors
-          if ($LASTEXITCODE -ne 0 -or $digest -cnotmatch '^sha256:[a-f0-9]{64}$') {
-            throw 'Cannot resolve gateway image digest'
-          }
-          "GATEWAY_IMAGE=$server/inference-gateway@$digest" >> $env:GITHUB_ENV
+          $tag = "$env:GITHUB_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $image = & .\scripts\build-gateway.ps1 -Registry $env:ACR_NAME -ResourceGroup $env:AZURE_RESOURCE_GROUP -Tag $tag
+          "GATEWAY_IMAGE=$image" >> $env:GITHUB_ENV
       - name: Deploy both apps with secure parameters
         if: ${{ !inputs.bootstrap_only }}
         env:

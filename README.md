@@ -187,15 +187,19 @@ replacing it.
 Azure ACR Tasks can build it without local Docker:
 
 ```powershell
-az acr build --registry $env:ACR_NAME --image inference-gateway:v1 --file Dockerfile .
-$loginServer = az acr show --name $env:ACR_NAME --query loginServer -o tsv
-$digest = az acr repository show --name $env:ACR_NAME --image inference-gateway:v1 --query digest -o tsv
-$env:GATEWAY_IMAGE = "$loginServer/inference-gateway@$digest"
+$env:GATEWAY_IMAGE = & .\scripts\build-gateway.ps1 -Registry $env:ACR_NAME -ResourceGroup $rg -Tag v1
 ```
 
 Stop on any CLI failure; do not continue with empty output variables.
 Registry role assignments may take a few minutes to propagate before the
 gateway can pull its image.
+
+The build script waits for ACR Tasks to finish and reads the exact image digest
+from that run's `outputImages` management-plane metadata. It does not call
+`az acr repository show`, which requires separate registry data-plane access and
+can fail even after a successful build/push. Registry admin login stays disabled.
+Build logs are available with `az acr task logs --registry <registry> --run-id <run-id>`;
+the script prints the completed run ID.
 
 Choose a tested official
 [llama.cpp CUDA 12 server image](https://github.com/ggml-org/llama.cpp/blob/master/docs/docker.md)
@@ -352,7 +356,7 @@ For this starter, grant the deployment identity:
 Contributor alone cannot create role assignments. An Azure administrator must
 grant these permissions before the first workflow run. Do not grant subscription
 Owner. With the bootstrap registry's standard RBAC mode, Contributor covers the
-resource deployment, ACR Tasks build, registry reads, and storage key retrieval.
+resource deployment, ACR Tasks build/run reads, and storage key retrieval.
 A custom least-privilege role can narrow this further; it must
 retain deployment validation/write, app and environment access, managed-identity
 assignment, and the registry build/read operations. ABAC-enabled registries need
@@ -517,6 +521,7 @@ failure stopped them.
 ```powershell
 npm test
 npm run check
+& .\scripts\test-acr-build.ps1
 az bicep build --file .\infra\bootstrap.bicep
 az bicep build --file .\infra\main.bicep
 ```
