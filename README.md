@@ -112,6 +112,11 @@ az containerapp env show --name $env:ACA_ENVIRONMENT --resource-group $rg --quer
 
 ### 1. Bootstrap registry and model storage
 
+For GitHub Actions, this step is automated on every manual deployment.
+Use **Run workflow -> bootstrap_only** for the first run, upload the model,
+then run again with that option unchecked. The commands below are an alternative
+for running bootstrap locally.
+
 [infra/bootstrap.bicep](infra/bootstrap.bicep) creates:
 
 - Basic Azure Container Registry with admin password disabled.
@@ -252,7 +257,9 @@ Bicep on pushes and pull requests. **Only a manual workflow run from the default
 branch deploys**, after validation succeeds and any `production` environment
 approvals are granted. Pull requests receive no Azure identity or inference keys.
 
-The workflow builds the **gateway** with ACR Tasks, resolves its digest, and uses
+The workflow first applies **bootstrap.bicep** to create/update the registry,
+model storage, read-only mount, and pull identity. It then checks that the GGUF
+file exists, builds the **gateway** with ACR Tasks, resolves its digest, and uses
 the main Bicep template to deploy **both apps**. The model app uses your pinned
 official llama.cpp CUDA image. Its GGUF weights stay in Azure Files; Actions does
 not rebuild the model runtime or upload/download the model on each deployment.
@@ -263,9 +270,9 @@ Docker does not need to be installed on the runner.
 
 1. Put this project in a GitHub repository. The workflow must be on the repository's
    default branch before **Run workflow** is available.
-2. Complete the bootstrap and model upload in Azure deployment steps 1-2 above
-   (the manual gateway build itself is optional; Actions will build it). Use the
-   bootstrap defaults for `qwen-gateway-pull`, `qwen-models`, and `models`.
+2. Choose globally unique registry and storage account names and configure the
+   GitHub environment settings below. If bootstrap was previously run locally,
+   use those same names so the workflow reuses the existing resources.
 3. Verify A100 quota, the CPU Consumption profile, and the named serverless A100
    profile. Verify the image digest really refers to `server-cuda`, not a CPU or
    macOS image; the workflow can validate digest syntax, not runtime compatibility.
@@ -274,9 +281,11 @@ Docker does not need to be installed on the runner.
    branch and enable required reviewers where your GitHub plan supports them.
 5. Set up Azure OIDC as described below. Do not create a long-lived Azure client secret.
 
-Bootstrap remains a one-time administrator task because it creates role
-assignments and storage. The deployment identity does not need permission to
-assign roles. The main template manages apps called `qwen-gateway` and
+Bootstrap is now automatic, so the deployment identity **also needs permission
+to create the AcrPull role assignment**, in addition to Contributor. Azure login,
+OIDC trust, initial role grants, the resource group, and the Container Apps
+environment must already exist; a workflow cannot grant itself these permissions.
+The main template manages apps called `qwen-gateway` and
 `qwen-model`; it will overwrite settings on existing apps with these names.
 Review changes before approval, including any portal-configured IP restrictions
 that aren't represented in the template.
@@ -299,11 +308,19 @@ Configure its federated credential for:
 The subject uses the **environment**, not `ref:refs/heads/main`, because this
 workflow's deployment job declares `environment: production`.
 
-For this starter, grant the deployment identity **Contributor scoped to the
-dedicated resource group** containing the apps, environment, registry, and pull
-identity. With the bootstrap registry's standard RBAC mode, this covers the
-deployment, ACR Tasks build, and registry metadata reads used here. Do not grant
-subscription Owner. A custom least-privilege role can narrow this further; it must
+For this starter, grant the deployment identity:
+
+- **Contributor**, scoped to the dedicated resource group.
+- **Role Based Access Control Administrator**, scoped to that same group, for
+  bootstrap's AcrPull assignment. Where practical, constrain its role-assignment
+  conditions to the AcrPull role and the intended pull identity. This permission
+  is powerful; protect the production environment and require approval.
+
+Contributor alone cannot create role assignments. An Azure administrator must
+grant these permissions before the first workflow run. Do not grant subscription
+Owner. With the bootstrap registry's standard RBAC mode, Contributor covers the
+resource deployment, ACR Tasks build, registry reads, and storage key retrieval.
+A custom least-privilege role can narrow this further; it must
 retain deployment validation/write, app and environment access, managed-identity
 assignment, and the registry build/read operations. ABAC-enabled registries need
 different repository permissions and are not the bootstrap configuration.
@@ -320,6 +337,7 @@ Add these **environment variables** (not secrets):
 | `AZURE_RESOURCE_GROUP` | Resource group containing the existing environment |
 | `ACA_ENVIRONMENT` | Existing Container Apps environment name |
 | `ACR_NAME` | Registry name, without `.azurecr.io` |
+| `STORAGE_ACCOUNT_NAME` | Globally unique model storage account name: 3-24 lowercase letters/digits |
 | `GPU_PROFILE_NAME` | Existing profile name whose type is `Consumption-GPU-NC24-A100` |
 | `MODEL_IMAGE` | `ghcr.io/ggml-org/llama.cpp@sha256:<64-character-digest>` for the CUDA server |
 
@@ -330,6 +348,9 @@ Add these **environment secrets**:
 | `GATEWAY_API_KEY` | Your random client key, at least 32 characters |
 | `BACKEND_API_KEY` | A different random backend key, at least 32 characters |
 
+For a bootstrap-only run, `GPU_PROFILE_NAME`, `MODEL_IMAGE`, and the two API-key
+secrets are not needed yet. Set them before the first full deployment.
+
 The environment's region is discovered automatically. Keys are exposed only to
 steps that need them, not to the ACR build step. No real-key parameter JSON or
 deployment artifact is published. Never enable shell tracing or CLI debug output
@@ -338,8 +359,34 @@ GitHub administrators with sufficient permissions remain trusted.
 
 ### Deploy and verify
 
-Open **Actions -> Validate and deploy inference apps -> Run workflow**, select
-the default branch, and approve the production deployment if requested.
+For the first deployment:
+
+1. Open **Actions -> Validate and deploy inference apps -> Run workflow**.
+2. Select the default branch and check **bootstrap_only**. Approve production
+   deployment if requested. This creates registry/storage/identity but skips
+   image building, model checks, app deployments, and smoke tests.
+3. Upload `Qwen3.8-27B-UD-Q6_K.gguf` to the `models` share using Storage Explorer,
+   following the model checksum/source verification instructions above.
+4. Set the remaining app variables/secrets and run the workflow again with
+   **bootstrap_only unchecked**. It reapplies bootstrap, checks the file, builds
+   the gateway, and deploys both apps.
+
+Subsequent runs normally leave **bootstrap_only unchecked**. Bootstrap is
+repeatable with the same resource names: it reconciles the template configuration
+without uploading or deleting the GGUF. It can overwrite manual changes to
+managed resource settings. Keep the names stable to avoid creating another
+registry/account. No automatic model download or upload is performed.
+
+If the model is missing, a full run fails explicitly **before building the image
+or deploying either app**. Bootstrap resources remain available for your upload.
+The existence check does not validate model contents or checksum; that remains
+part of the upload procedure. It temporarily reads/masks a storage account key,
+uses it only in that step's environment, and does not save it to Actions outputs.
+
+Bootstrap-only does not deploy or start GPU apps, but **does not stop existing
+apps** either. Registry/storage charges apply. It still needs the existing
+Container Apps environment, but does not require GPU quota/profile readiness
+until a full app deployment.
 
 The deployment job is serialized and does not cancel an active deployment.
 It creates uniquely named revisions of **both** apps on every run, even when the

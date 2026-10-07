@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      bootstrap_only:
+        description: Create registry/storage/identity only, then upload the GGUF before a full run
+        type: boolean
+        default: false
+        required: true
 
 permissions:
   contents: read
@@ -71,9 +77,11 @@ jobs:
       AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
       ACA_ENVIRONMENT: ${{ vars.ACA_ENVIRONMENT }}
       ACR_NAME: ${{ vars.ACR_NAME }}
+      STORAGE_ACCOUNT_NAME: ${{ vars.STORAGE_ACCOUNT_NAME }}
       GPU_PROFILE_NAME: ${{ vars.GPU_PROFILE_NAME }}
       MODEL_IMAGE: ${{ vars.MODEL_IMAGE }}
       DEPLOYMENT_REVISION: gh-${{ github.run_id }}-${{ github.run_attempt }}
+      BOOTSTRAP_ONLY: ${{ inputs.bootstrap_only }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -81,12 +89,26 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
-      - name: Validate deployment settings
+      - name: Validate bootstrap settings
+        run: |
+          foreach ($name in @('AZURE_RESOURCE_GROUP', 'ACA_ENVIRONMENT', 'ACR_NAME', 'STORAGE_ACCOUNT_NAME')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Missing production variable: $name"
+            }
+          }
+          if ($env:STORAGE_ACCOUNT_NAME -cnotmatch '^[a-z0-9]{3,24}$') {
+            throw 'STORAGE_ACCOUNT_NAME must be 3-24 lowercase letters and digits'
+          }
+          if ($env:ACR_NAME -notmatch '^[a-zA-Z0-9]{5,50}$') {
+            throw 'ACR_NAME must be 5-50 letters and digits'
+          }
+      - name: Validate app deployment settings
+        if: ${{ !inputs.bootstrap_only }}
         env:
           GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
           BACKEND_API_KEY: ${{ secrets.BACKEND_API_KEY }}
         run: |
-          foreach ($name in @('AZURE_RESOURCE_GROUP', 'ACA_ENVIRONMENT', 'ACR_NAME', 'GPU_PROFILE_NAME', 'MODEL_IMAGE')) {
+          foreach ($name in @('GPU_PROFILE_NAME', 'MODEL_IMAGE')) {
             if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
               throw "Missing production variable: $name"
             }
@@ -121,12 +143,50 @@ jobs:
           $cpu = @($environment.properties.workloadProfiles | Where-Object {
             $_.name -eq 'Consumption' -and $_.workloadProfileType -eq 'Consumption'
           })
-          if ($gpu.Count -ne 1 -or $cpu.Count -ne 1) {
+          if ($env:BOOTSTRAP_ONLY -ne 'true' -and ($gpu.Count -ne 1 -or $cpu.Count -ne 1)) {
             throw 'The configured serverless A100 profile and CPU Consumption profile must both exist'
           }
           if ([string]::IsNullOrWhiteSpace($environment.location)) { throw 'Environment region is missing' }
           "AZURE_LOCATION=$($environment.location)" >> $env:GITHUB_ENV
+      - name: Bootstrap registry, storage, and pull identity
+        run: |
+          $parameters = @(
+            "environmentName=$env:ACA_ENVIRONMENT",
+            "location=$env:AZURE_LOCATION",
+            "registryName=$env:ACR_NAME",
+            "storageAccountName=$env:STORAGE_ACCOUNT_NAME"
+          )
+          az deployment group validate --resource-group $env:AZURE_RESOURCE_GROUP --template-file .\infra\bootstrap.bicep --parameters @parameters --only-show-errors --output none
+          if ($LASTEXITCODE -ne 0) { throw 'Bootstrap validation failed; verify resource names and role-assignment permissions' }
+          $name = "bootstrap-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          az deployment group create --name $name --resource-group $env:AZURE_RESOURCE_GROUP --template-file .\infra\bootstrap.bicep --parameters @parameters --only-show-errors --output none
+          if ($LASTEXITCODE -ne 0) { throw 'Bootstrap deployment failed' }
+          "### Bootstrap complete" >> $env:GITHUB_STEP_SUMMARY
+          "Registry: $env:ACR_NAME" >> $env:GITHUB_STEP_SUMMARY
+          "Model storage: $env:STORAGE_ACCOUNT_NAME / models (read-only model mount)" >> $env:GITHUB_STEP_SUMMARY
+          if ($env:BOOTSTRAP_ONLY -eq 'true') {
+            "No apps were deployed. Upload Qwen3.8-27B-UD-Q6_K.gguf to the models share, then run again with bootstrap_only unchecked." >> $env:GITHUB_STEP_SUMMARY
+            "Any previously deployed apps remain unchanged; bootstrap-only does not stop existing GPU replicas." >> $env:GITHUB_STEP_SUMMARY
+          }
+      - name: Require uploaded model before building or deploying apps
+        if: ${{ !inputs.bootstrap_only }}
+        run: |
+          try {
+            $key = az storage account keys list --resource-group $env:AZURE_RESOURCE_GROUP --account-name $env:STORAGE_ACCOUNT_NAME --query '[0].value' -o tsv --only-show-errors
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($key)) { throw 'Cannot read the model storage credential' }
+            Write-Output "::add-mask::$key"
+            $env:AZURE_STORAGE_KEY = $key
+            $exists = az storage file exists --account-name $env:STORAGE_ACCOUNT_NAME --share-name models --path Qwen3.8-27B-UD-Q6_K.gguf --query exists -o tsv --only-show-errors
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot check the model file; verify storage connectivity' }
+            if ($exists.Trim() -ne 'true') {
+              throw 'Model is missing. Bootstrap has completed: upload Qwen3.8-27B-UD-Q6_K.gguf to the models share, then rerun. No apps were deployed.'
+            }
+          } finally {
+            if (Test-Path Env:\AZURE_STORAGE_KEY) { Remove-Item Env:\AZURE_STORAGE_KEY }
+            $key = $null
+          }
       - name: Build gateway in ACR and resolve immutable digest
+        if: ${{ !inputs.bootstrap_only }}
         run: |
           $imageTag = "inference-gateway:$env:GITHUB_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           az acr build --registry $env:ACR_NAME --image $imageTag --file Dockerfile --platform linux/amd64 . --only-show-errors
@@ -139,6 +199,7 @@ jobs:
           }
           "GATEWAY_IMAGE=$server/inference-gateway@$digest" >> $env:GITHUB_ENV
       - name: Deploy both apps with secure parameters
+        if: ${{ !inputs.bootstrap_only }}
         env:
           GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
           BACKEND_API_KEY: ${{ secrets.BACKEND_API_KEY }}
@@ -152,6 +213,7 @@ jobs:
           }
           "GATEWAY_BASE_URL=$baseUrl" >> $env:GITHUB_ENV
       - name: Verify deployed boundaries and revisions
+        if: ${{ !inputs.bootstrap_only }}
         run: |
           foreach ($name in @('qwen-gateway', 'qwen-model')) {
             $raw = az containerapp show --name $name --resource-group $env:AZURE_RESOURCE_GROUP -o json --only-show-errors
@@ -170,6 +232,7 @@ jobs:
             }
           }
       - name: Smoke test the gateway without inference
+        if: ${{ !inputs.bootstrap_only }}
         env:
           GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
         run: |
