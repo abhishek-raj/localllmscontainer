@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       bootstrap_only:
-        description: Create registry/storage/identity only, then upload the GGUF before a full run
+        description: Create registry/storage/identity only (skip model download and app deployment)
         type: boolean
         default: false
         required: true
@@ -62,7 +62,7 @@ jobs:
     needs: validate
     if: github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
     environment: production
     concurrency:
       group: inference-production-deployment
@@ -165,22 +165,23 @@ jobs:
           "Registry: $env:ACR_NAME" >> $env:GITHUB_STEP_SUMMARY
           "Model storage: $env:STORAGE_ACCOUNT_NAME / models (read-only model mount)" >> $env:GITHUB_STEP_SUMMARY
           if ($env:BOOTSTRAP_ONLY -eq 'true') {
-            "No apps were deployed. Upload Qwen3.8-27B-UD-Q6_K.gguf to the models share, then run again with bootstrap_only unchecked." >> $env:GITHUB_STEP_SUMMARY
+            "No model was downloaded and no apps were deployed. Run again with bootstrap_only unchecked to download the pinned model and deploy." >> $env:GITHUB_STEP_SUMMARY
             "Any previously deployed apps remain unchanged; bootstrap-only does not stop existing GPU replicas." >> $env:GITHUB_STEP_SUMMARY
           }
-      - name: Require uploaded model before building or deploying apps
+      - name: Stream and verify pinned model into Azure Files
         if: ${{ !inputs.bootstrap_only }}
+        timeout-minutes: 100
         run: |
           try {
             $key = az storage account keys list --resource-group $env:AZURE_RESOURCE_GROUP --account-name $env:STORAGE_ACCOUNT_NAME --query '[0].value' -o tsv --only-show-errors
             if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($key)) { throw 'Cannot read the model storage credential' }
             Write-Output "::add-mask::$key"
             $env:AZURE_STORAGE_KEY = $key
-            $exists = az storage file exists --account-name $env:STORAGE_ACCOUNT_NAME --share-name models --path Qwen3.8-27B-UD-Q6_K.gguf --query exists -o tsv --only-show-errors
-            if ($LASTEXITCODE -ne 0) { throw 'Cannot check the model file; verify storage connectivity' }
-            if ($exists.Trim() -ne 'true') {
-              throw 'Model is missing. Bootstrap has completed: upload Qwen3.8-27B-UD-Q6_K.gguf to the models share, then rerun. No apps were deployed.'
-            }
+            node .\dist\scripts\download-model.js
+            if ($LASTEXITCODE -ne 0) { throw 'Model transfer or verification failed; app deployment blocked' }
+            $model = Get-Content .\model.json -Raw | ConvertFrom-Json
+            "Model file verified: $($model.fileName)" >> $env:GITHUB_STEP_SUMMARY
+            "Context window: $($model.contextTokens) tokens" >> $env:GITHUB_STEP_SUMMARY
           } finally {
             if (Test-Path Env:\AZURE_STORAGE_KEY) { Remove-Item Env:\AZURE_STORAGE_KEY }
             $key = $null

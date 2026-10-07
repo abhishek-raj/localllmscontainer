@@ -32,6 +32,15 @@ Coding client --HTTPS/Bearer key--> Public CPU gateway
   attempts per minute, 4096 output tokens. `max_completion_tokens` is normalized
   to `max_tokens`; unbounded values, `n_predict`, and `n > 1` are rejected.
 - Non-root Docker image and Bicep for a public CPU app and internal A100 app.
+- Pinned **Qwen3.8-27B UD-Q4_K_M (4-bit)** with a **65,536-token context**.
+  [model.json](model.json) is shared by the model downloader and Bicep parameters.
+- Workflow-time model transfer from Hugging Face into Azure Files, using bounded
+  4 MiB ranges, exact size/SHA-256 verification, and a verified-file cache.
+
+The 65,536-token context includes input and output. GPU memory and prompt latency
+at this size still need a live test. The gateway's 1 MiB body limit, 4096-output-token
+limit, and 210-second upstream timeout are unchanged; some large prompts may hit
+these limits before filling the model's context window.
 
 This is a focused OpenAI **Chat Completions/Completions** proxy, not the entire
 OpenAI API. Responses API, embeddings, file uploads, image generation, WebSockets,
@@ -113,8 +122,9 @@ az containerapp env show --name $env:ACA_ENVIRONMENT --resource-group $rg --quer
 ### 1. Bootstrap registry and model storage
 
 For GitHub Actions, this step is automated on every manual deployment.
-Use **Run workflow -> bootstrap_only** for the first run, upload the model,
-then run again with that option unchecked. The commands below are an alternative
+Leave **bootstrap_only unchecked** to bootstrap, download/verify the model, and
+deploy both apps in one run. Check it only to provision infrastructure without
+transferring the model or deploying apps. The commands below are an alternative
 for running bootstrap locally.
 
 [infra/bootstrap.bicep](infra/bootstrap.bicep) creates:
@@ -137,12 +147,34 @@ az deployment group what-if --resource-group $rg --template-file .\infra\bootstr
 az deployment group create --resource-group $rg --template-file .\infra\bootstrap.bicep --parameters environmentName=$env:ACA_ENVIRONMENT location=$env:AZURE_LOCATION registryName=$env:ACR_NAME storageAccountName=$storage
 ```
 
-Download `Qwen3.8-27B-UD-Q6_K.gguf` from
-[the Unsloth repository](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF).
-This is the **dynamic** Q6_K variant. Review the model license and source; compare
-its SHA-256 with the file's published LFS SHA-256 and record the repository revision.
-Upload this one file to the root of the `models` share with Azure Storage Explorer.
-If using another GGUF, update `modelFile` in the parameters and verify runtime support.
+The workflow automatically transfers `Qwen3.8-27B-UD-Q4_K_M.gguf` from
+[the Unsloth repository](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) using
+the immutable revision, size, and SHA-256 recorded in [model.json](model.json).
+This is the **dynamic** Q4_K_M variant, approximately 16.46 GB (15.33 GiB).
+Review its license and source before deployment. The file never passes through
+your computer or gets fully buffered on the runner's disk.
+
+For a local CLI deployment, you can either upload the file manually to the root
+of the `models` share or invoke the same downloader after bootstrap:
+
+```powershell
+npm ci
+npm run build
+$env:STORAGE_ACCOUNT_NAME = $storage
+try {
+  $env:AZURE_STORAGE_KEY = az storage account keys list --resource-group $rg --account-name $storage --query '[0].value' -o tsv
+  if ($LASTEXITCODE -ne 0) { throw 'Cannot read storage credential' }
+  node .\dist\scripts\download-model.js
+  if ($LASTEXITCODE -ne 0) { throw 'Model transfer failed' }
+} finally {
+  if (Test-Path Env:\AZURE_STORAGE_KEY) { Remove-Item Env:\AZURE_STORAGE_KEY }
+}
+```
+
+Running that command **locally** uses your machine's bandwidth. Prefer GitHub
+Actions to keep the transfer off your computer. To change the model in the
+workflow, update the manifest's filename, revision, size, and hash together.
+Changing `MODEL_IMAGE` changes only the serving runtime, not the weights.
 
 **Complete the upload before deploying the GPU app.** The app loads from
 `/models` and never downloads weights at startup. Azure Files throughput can
@@ -258,11 +290,12 @@ branch deploys**, after validation succeeds and any `production` environment
 approvals are granted. Pull requests receive no Azure identity or inference keys.
 
 The workflow first applies **bootstrap.bicep** to create/update the registry,
-model storage, read-only mount, and pull identity. It then checks that the GGUF
-file exists, builds the **gateway** with ACR Tasks, resolves its digest, and uses
+model storage, read-only mount, and pull identity. It then downloads/verifies the
+pinned GGUF if needed, builds the **gateway** with ACR Tasks, resolves its digest, and uses
 the main Bicep template to deploy **both apps**. The model app uses your pinned
 official llama.cpp CUDA image. Its GGUF weights stay in Azure Files; Actions does
-not rebuild the model runtime or upload/download the model on each deployment.
+not rebuild the model runtime. A valid verification receipt skips model transfers
+on later deployments.
 ACR Tasks performs the Linux image build remotely from the Windows runner, so
 Docker does not need to be installed on the runner.
 
@@ -362,26 +395,54 @@ GitHub administrators with sufficient permissions remain trusted.
 For the first deployment:
 
 1. Open **Actions -> Validate and deploy inference apps -> Run workflow**.
-2. Select the default branch and check **bootstrap_only**. Approve production
-   deployment if requested. This creates registry/storage/identity but skips
-   image building, model checks, app deployments, and smoke tests.
-3. Upload `Qwen3.8-27B-UD-Q6_K.gguf` to the `models` share using Storage Explorer,
-   following the model checksum/source verification instructions above.
-4. Set the remaining app variables/secrets and run the workflow again with
-   **bootstrap_only unchecked**. It reapplies bootstrap, checks the file, builds
-   the gateway, and deploys both apps.
+2. Select the default branch and leave **bootstrap_only unchecked**. Approve
+   production deployment if requested.
+3. The run creates the registry/storage/identity, transfers and verifies the
+   pinned 4-bit model, builds the gateway, and deploys both apps.
+
+If you only want infrastructure first, check **bootstrap_only** instead; no model
+transfer, image build, app deployment, or smoke test runs. Once app variables and
+secrets are ready, run again with that option unchecked. Manual uploading is no
+longer required.
 
 Subsequent runs normally leave **bootstrap_only unchecked**. Bootstrap is
 repeatable with the same resource names: it reconciles the template configuration
 without uploading or deleting the GGUF. It can overwrite manual changes to
 managed resource settings. Keep the names stable to avoid creating another
-registry/account. No automatic model download or upload is performed.
+registry/account. Old model files (including previous Q6 weights) are not deleted.
 
-If the model is missing, a full run fails explicitly **before building the image
-or deploying either app**. Bootstrap resources remain available for your upload.
-The existence check does not validate model contents or checksum; that remains
-part of the upload procedure. It temporarily reads/masks a storage account key,
-uses it only in that step's environment, and does not save it to Actions outputs.
+### Model transfer safety and costs
+
+- [scripts/download-model.ts](scripts/download-model.ts) streams from the pinned
+  Hugging Face revision into a unique `.partial` file in Azure Files. It does not
+  allocate the entire model in memory or download it to the runner's disk.
+- Uploads use sequential ranges of at most **4 MiB**, with per-range transport
+  MD5 checks and whole-source SHA-256/size verification. Only after all bytes
+  verify does it rename the temporary file to the final filename, without
+  replacing an existing destination.
+- A small `.verified.json` receipt records the source revision/hash, size, and
+  Azure file ETag. Matching receipt and file properties allow subsequent runs to
+  skip the transfer. Missing/stale receipts trigger streaming verification of
+  the existing Azure file; changed or corrupt files fail rather than being
+  silently overwritten. A manually uploaded file is verified this way once.
+- Storage administrators can alter both a file and its receipt; they remain
+  trusted. The receipt is a cache optimization, not a cryptographic signature.
+- On transfer failure, only that run's temporary files are cleaned up, and
+  **app deployment is blocked**. Azure SDK requests have bounded retries; there
+  is no whole-transfer resume. Rerun to retry from the beginning.
+- Cancellation can leave a uniquely named `.partial` file, which is never used
+  for inference. Remove stale partials after verifying no transfer is running.
+  Cleanup failures are logged explicitly. Bootstrap and any previously deployed
+  apps remain; a failed run does not shut down old GPU replicas.
+- The storage account key is captured/masked in the transfer step, passed only
+  through its environment, and cleared afterward. It is not sent to Hugging Face
+  or saved in Actions outputs. Signed source URLs and raw SDK errors are not logged.
+- The transfer uses GitHub runner time and Azure Files transactions/storage,
+  not your computer's bandwidth or a GPU. Reverification of an existing file
+  downloads its bytes from Azure and may incur egress charges.
+- The transfer has a 90-minute deadline (100-minute step limit); the deployment
+  job has a 180-minute limit. Neither is an inference timeout: inference still
+  has the gateway's 210-second total deadline.
 
 Bootstrap-only does not deploy or start GPU apps, but **does not stop existing
 apps** either. Registry/storage charges apply. It still needs the existing

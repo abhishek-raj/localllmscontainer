@@ -21,8 +21,13 @@ param gatewayImage string
 @description('Official llama.cpp server-cuda image pinned by digest, e.g. ghcr.io/ggml-org/llama.cpp@sha256:...')
 param modelImage string
 
-param modelFile string = 'Qwen3.8-27B-UD-Q6_K.gguf'
+@description('Supplied from model.json by main.bicepparam.')
+param modelFile string
 param modelAlias string = 'qwen3.8-27b'
+
+@minValue(1024)
+@maxValue(262144)
+param contextTokens int
 
 @description('Optional unique suffix to create fresh revisions of both apps, including after secret rotation.')
 @maxLength(50)
@@ -74,7 +79,7 @@ resource model 'Microsoft.App/containerApps@2025-01-01' = {
           { name: 'LLAMA_ARG_HOST', value: '0.0.0.0' }
           { name: 'LLAMA_ARG_PORT', value: '8080' }
           { name: 'LLAMA_ARG_N_GPU_LAYERS', value: 'all' }
-          { name: 'LLAMA_ARG_CTX_SIZE', value: '16384' }
+          { name: 'LLAMA_ARG_CTX_SIZE', value: string(contextTokens) }
           { name: 'LLAMA_ARG_N_PARALLEL', value: '1' }
           { name: 'LLAMA_ARG_JINJA', value: 'true' }
           { name: 'LLAMA_API_KEY', secretRef: 'backend-api-key' }
