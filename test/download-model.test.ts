@@ -70,9 +70,9 @@ function manifestFor(bytes: Buffer): ModelManifest {
 
 const quiet = () => {};
 
-test("model manifest pins the four-bit file, digest, revision, and 65536 context", async () => {
+test("model manifest pins the four-bit file, digest, revision, and 262144 context", async () => {
   const manifest = parseManifest(JSON.parse(await readFile(new URL("../../model.json", import.meta.url), "utf8")));
-  assert.equal(manifest.contextTokens, 65536);
+  assert.equal(manifest.contextTokens, 262144);
   assert.equal(manifest.fileName, "Qwen3.8-27B-UD-Q4_K_M.gguf");
   assert.equal(manifest.sizeBytes, 16464440224);
   for (const override of [

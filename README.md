@@ -31,19 +31,21 @@ Coding client --HTTPS/Bearer key--> Public CPU gateway
   bounded upload and upstream timeouts, no automatic retries, no redirect following.
 - Separate backend credentials; client headers, cookies, and backend error bodies
   are not forwarded indiscriminately. No request bodies or keys in application logs.
-- Default limits: 1 MiB body, one active inference/upload, 30 authenticated inference
-  attempts per minute, 4096 output tokens. `max_completion_tokens` is normalized
+- Deployed limits: 1 MiB body, three active inference/upload requests, 30 authenticated
+  inference attempts per minute, 4096 output tokens. `max_completion_tokens` is normalized
   to `max_tokens`; unbounded values, `n_predict`, and `n > 1` are rejected.
 - Non-root Docker image and Bicep for a public CPU app and internal A100 app.
-- Pinned **Qwen3.8-27B UD-Q4_K_M (4-bit)** with a **65,536-token context**.
-  [model.json](model.json) is shared by the model downloader and Bicep parameters.
+- Pinned **Qwen3.8-27B UD-Q4_K_M (4-bit)** with a **262,144-token context** (the
+  model's native maximum), served by three parallel llama.cpp slots that share one
+  unified KV cache. [model.json](model.json) is shared by the model downloader and Bicep parameters.
 - Workflow-time model transfer from Hugging Face into Azure Files, using bounded
   4 MiB ranges, exact size/SHA-256 verification, and a verified-file cache.
 
-The 65,536-token context includes input and output. Full-context inference memory
+The 262,144-token context includes input and output and is a shared pool: any one
+request can use all of it, but concurrent requests compete for it. Full-context inference memory
 and prompt latency still need a live test. The gateway's 1 MiB body limit, 4096-output-token
-limit, and 210-second upstream timeout are unchanged; some large prompts may hit
-these limits before filling the model's context window.
+limit, and 210-second upstream timeout are unchanged; large prompts will hit
+these limits well before filling the model's context window.
 
 This is a focused OpenAI **Chat Completions/Completions** proxy, not the entire
 OpenAI API. Responses API, embeddings, file uploads, image generation, WebSockets,

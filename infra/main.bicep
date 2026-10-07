@@ -80,7 +80,8 @@ resource model 'Microsoft.App/containerApps@2025-01-01' = {
           { name: 'LLAMA_ARG_PORT', value: '8080' }
           { name: 'LLAMA_ARG_N_GPU_LAYERS', value: 'all' }
           { name: 'LLAMA_ARG_CTX_SIZE', value: string(contextTokens) }
-          { name: 'LLAMA_ARG_N_PARALLEL', value: '1' }
+          { name: 'LLAMA_ARG_N_PARALLEL', value: '3' }
+          { name: 'LLAMA_ARG_KV_UNIFIED', value: 'true' }
           { name: 'LLAMA_ARG_JINJA', value: 'true' }
           { name: 'LLAMA_API_KEY', secretRef: 'backend-api-key' }
         ]
@@ -113,7 +114,7 @@ resource model 'Microsoft.App/containerApps@2025-01-01' = {
         cooldownPeriod: 600
         rules: [{
           name: 'inference-http'
-          http: { metadata: { concurrentRequests: '1' } }
+          http: { metadata: { concurrentRequests: '3' } }
         }]
       }
     }
@@ -160,7 +161,7 @@ resource gateway 'Microsoft.App/containerApps@2025-01-01' = {
           { name: 'GATEWAY_API_KEY', secretRef: 'gateway-api-key' }
           { name: 'BACKEND_API_KEY', secretRef: 'backend-api-key' }
           { name: 'MAX_BODY_BYTES', value: '1048576' }
-          { name: 'MAX_CONCURRENT_REQUESTS', value: '1' }
+          { name: 'MAX_CONCURRENT_REQUESTS', value: '3' }
           { name: 'REQUESTS_PER_MINUTE', value: '30' }
           { name: 'MAX_OUTPUT_TOKENS', value: '4096' }
           { name: 'UPSTREAM_TIMEOUT_MS', value: '210000' }
