@@ -39,6 +39,7 @@ jobs:
           npm run check
           if ($LASTEXITCODE -ne 0) { throw 'Type checking failed' }
           & .\scripts\test-acr-build.ps1
+          & .\scripts\test-model-ready.ps1
       - name: Compile infrastructure without Azure credentials
         run: |
           az bicep install
@@ -221,9 +222,15 @@ jobs:
             if ($app.properties.template.scale.minReplicas -ne 0 -or $app.properties.template.scale.maxReplicas -ne 1) {
               throw "Unexpected replica limits on $name"
             }
+            if ($name -eq 'qwen-model' -and $app.properties.template.scale.cooldownPeriod -ne 600) {
+              throw 'Model startup cooldown was not applied'
+            }
             $expectedRevision = "$name--$env:DEPLOYMENT_REVISION"
-            if ($app.properties.latestReadyRevisionName -ne $expectedRevision) {
-              throw "New revision of $name is not ready; inspect its logs"
+            if ($app.properties.latestRevisionName -ne $expectedRevision) {
+              throw "Unexpected latest revision of $name; inspect the deployment"
+            }
+            if ($name -eq 'qwen-gateway' -and $app.properties.latestReadyRevisionName -ne $expectedRevision) {
+              throw 'The new gateway revision is not ready; inspect its logs'
             }
           }
       - name: Smoke test the gateway without inference
@@ -233,8 +240,20 @@ jobs:
         run: |
           node .\scripts\smoke.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Gateway smoke tests failed' }
-          "### Deployment verified" >> $env:GITHUB_STEP_SUMMARY
+          "### Gateway checks passed" >> $env:GITHUB_STEP_SUMMARY
           "Gateway base URL: $env:GATEWAY_BASE_URL" >> $env:GITHUB_STEP_SUMMARY
           "Gateway image: $env:GATEWAY_IMAGE" >> $env:GITHUB_STEP_SUMMARY
           "Model image: $env:MODEL_IMAGE" >> $env:GITHUB_STEP_SUMMARY
           "Health, local discovery, and rejected-auth checks passed. No inference request was sent." >> $env:GITHUB_STEP_SUMMARY
+      - name: Warm model and verify exact revision health
+        if: ${{ !inputs.bootstrap_only }}
+        timeout-minutes: 20
+        env:
+          GATEWAY_API_KEY: ${{ secrets.GATEWAY_API_KEY }}
+        run: |
+          node .\scripts\warmup.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Model warmup failed; inspect model logs' }
+          & .\scripts\verify-model-ready.ps1 -ResourceGroup $env:AZURE_RESOURCE_GROUP -Revision "qwen-model--$env:DEPLOYMENT_REVISION"
+          "### Model startup verified" >> $env:GITHUB_STEP_SUMMARY
+          "Authenticated model health and the exact deployed model revision are healthy. No inference was generated." >> $env:GITHUB_STEP_SUMMARY
+          "GPU startup and the 10-minute idle cooldown are billable. Minimum replicas remain zero." >> $env:GITHUB_STEP_SUMMARY

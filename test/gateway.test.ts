@@ -359,3 +359,111 @@ test("configuration fails closed on missing, placeholder, weak, and shared keys"
   assert.throws(() => loadConfig({ ...good, MAX_CONCURRENT_REQUESTS: "0" }), /MAX_CONCURRENT_REQUESTS/);
   assert.throws(() => loadConfig({ ...good, MAX_BODY_BYTES: "NaN" }), /MAX_BODY_BYTES/);
 });
+
+function warm(app: { url: string }, body = "{}", authorization = `Bearer ${clientKey}`, path = "/warmup") {
+  return fetch(app.url + path, {
+    method: "POST",
+    headers: { authorization, "content-type": "application/json" },
+    body,
+  });
+}
+
+test("unauthorized, malformed, and nonexact warmup requests never wake the model", async (t) => {
+  const app = await setup(t);
+  for (const key of ["", "Bearer wrong"]) {
+    const response = await warm(app, "{}", key);
+    assert.equal(response.status, 401);
+    await response.text();
+  }
+  for (const body of ["", "{", "[]", "null", '{"target":"https://evil.example"}']) {
+    const response = await warm(app, body);
+    assert.equal(response.status, 400);
+    await response.text();
+  }
+  for (const path of ["/warmup?target=evil", "/warmup/", "/v1/warmup"]) {
+    const response = await warm(app, "{}", `Bearer ${clientKey}`, path);
+    assert.equal(response.status, 404);
+    await response.text();
+  }
+  const wrongMethod = await fetch(app.url + "/warmup", { headers: { authorization: `Bearer ${clientKey}` } });
+  assert.equal(wrongMethod.status, 404);
+  await wrongMethod.text();
+  assert.equal(app.calls(), 0);
+});
+
+test("warmup calls only backend health with backend credentials and sanitizes responses", async (t) => {
+  const app = await setup(t, (req, res) => {
+    assert.equal(req.method, "GET");
+    assert.equal(req.url, "/health");
+    assert.equal(req.headers.authorization, `Bearer ${backendKey}`);
+    res.writeHead(200, { "set-cookie": backendKey });
+    res.end(backendKey);
+  });
+  const response = await warm(app);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { status: "ready" });
+  assert.equal(response.headers.get("set-cookie"), null);
+  assert.equal(app.calls(), 1);
+  assert(!JSON.stringify(app.events).includes(backendKey));
+});
+
+test("warming health and ingress statuses return explicit pending rather than false success", async (t) => {
+  for (const status of [502, 503, 504]) {
+    const app = await setup(t, (_req, res) => res.writeHead(status).end(backendKey));
+    const response = await warm(app);
+    assert.equal(response.status, 202);
+    assert.equal(response.headers.get("retry-after"), "5");
+    assert.deepEqual(await response.json(), { status: "warming" });
+    assert.equal(app.calls(), 1);
+  }
+});
+
+test("warmup timeout releases capacity and never retries in the gateway", async (t) => {
+  const app = await setup(t, () => {}, { upstreamTimeoutMs: 50 });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const response = await warm(app);
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), { status: "warming" });
+  }
+  assert.equal(app.calls(), 2);
+  assert.equal(app.events.filter((event) => event.event === "warmup_pending").length, 2);
+});
+
+test("warmup shares rate and concurrency limits with inference", async (t) => {
+  const contacted = new EventEmitter();
+  let finish: (() => void) | undefined;
+  const app = await setup(t, (_req, res) => {
+    finish = () => res.end("{}");
+    contacted.emit("request");
+  }, { requestsPerMinute: 3 });
+  const arrived = once(contacted, "request");
+  const pending = warm(app);
+  await arrived;
+  for (const request of [() => app.post(), () => warm(app)]) {
+    const busy = await request();
+    assert.equal(busy.status, 429);
+    await busy.text();
+  }
+  assert(finish);
+  finish();
+  await (await pending).text();
+  const limited = await warm(app);
+  assert.equal(limited.status, 429);
+  assert.match(await limited.text(), /rate_limit/);
+  assert.equal(app.calls(), 1);
+});
+
+test("warmup errors and redirects fail explicitly without leaking backend information", async (t) => {
+  for (const status of [307, 401, 500]) {
+    const app = await setup(t, (_req, res) => {
+      res.writeHead(status, { location: "/do-not-follow", "x-private": backendKey });
+      res.end(backendKey);
+    });
+    const response = await warm(app);
+    assert.equal(response.status, 502);
+    assert.equal(response.headers.get("location"), null);
+    assert.equal(response.headers.get("x-private"), null);
+    assert(!(await response.text()).includes(backendKey));
+    assert.equal(app.calls(), 1);
+  }
+});

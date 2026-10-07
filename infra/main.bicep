@@ -110,7 +110,7 @@ resource model 'Microsoft.App/containerApps@2025-01-01' = {
       scale: {
         minReplicas: 0
         maxReplicas: 1
-        cooldownPeriod: 120
+        cooldownPeriod: 600
         rules: [{
           name: 'inference-http'
           http: { metadata: { concurrentRequests: '1' } }

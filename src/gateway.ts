@@ -69,7 +69,7 @@ function readBody(req: IncomingMessage, config: Config): Promise<Buffer> {
   });
 }
 
-function validateBody(raw: Buffer, config: Config): string {
+function parseBody(raw: Buffer): object {
   let body: unknown;
   try {
     body = JSON.parse(raw.toString("utf8"));
@@ -80,6 +80,11 @@ function validateBody(raw: Buffer, config: Config): string {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw new RequestError(400, "invalid_body", "Request body must be a JSON object");
   }
+  return body;
+}
+
+function validateBody(raw: Buffer, config: Config): string {
+  const body = parseBody(raw);
   if (!("model" in body) || body.model !== config.modelAlias) {
     throw new RequestError(400, "invalid_model", `Use model ${config.modelAlias}`);
   }
@@ -132,6 +137,11 @@ export function createGateway(
     const controller = new AbortController();
     const started = Date.now();
     let timedOut = false;
+    let isWarmup = false;
+    const warming = () => {
+      res.setHeader("retry-after", "5");
+      reply(res, 202, { status: "warming" });
+    };
     const onClose = () => controller.abort();
     res.once("close", onClose);
     try {
@@ -152,7 +162,8 @@ export function createGateway(
         });
         return;
       }
-      if (req.method !== "POST" || !["/v1/chat/completions", "/v1/completions"].includes(req.url ?? "")) {
+      isWarmup = req.method === "POST" && req.url === "/warmup";
+      if (!isWarmup && (req.method !== "POST" || !["/v1/chat/completions", "/v1/completions"].includes(req.url ?? ""))) {
         throw new RequestError(404, "not_found", "Endpoint not supported");
       }
       if (req.headers["content-type"]?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
@@ -180,15 +191,23 @@ export function createGateway(
       }
       active++;
       acquired = true;
-      const body = validateBody(await readBody(req, config), config);
+      const raw = await readBody(req, config);
+      let body: string | null = null;
+      if (isWarmup) {
+        if (Object.keys(parseBody(raw)).length !== 0) {
+          throw new RequestError(400, "invalid_body", "Warmup requires an empty JSON object");
+        }
+      } else {
+        body = validateBody(raw, config);
+      }
       if (res.destroyed) throw new RequestError(400, "client_disconnected", "Client disconnected");
       timeout = setTimeout(() => {
         timedOut = true;
         controller.abort();
-      }, config.upstreamTimeoutMs);
+      }, isWarmup ? Math.min(10000, config.upstreamTimeoutMs) : config.upstreamTimeoutMs);
       timeout.unref();
-      const upstream = await fetch(new URL(req.url!, config.backendUrl), {
-        method: "POST",
+      const upstream = await fetch(new URL(isWarmup ? "/health" : req.url!, config.backendUrl), {
+        method: isWarmup ? "GET" : "POST",
         headers: {
           "authorization": `Bearer ${config.backendApiKey}`,
           "content-type": "application/json",
@@ -199,6 +218,18 @@ export function createGateway(
         signal: controller.signal,
         redirect: "manual",
       });
+      if (isWarmup) {
+        await upstream.body?.cancel();
+        log({ event: "warmup_checked", requestId, status: upstream.status, durationMs: Date.now() - started });
+        if (upstream.status === 200) {
+          reply(res, 200, { status: "ready" });
+        } else if ([502, 503, 504].includes(upstream.status)) {
+          warming();
+        } else {
+          throw new RequestError(502, "warmup_failed", "Model health check failed; inspect model server logs");
+        }
+        return;
+      }
       if (!upstream.ok || !upstream.body) {
         await upstream.body?.cancel();
         log({ event: "upstream_rejected", requestId, status: upstream.status });
@@ -217,8 +248,13 @@ export function createGateway(
       await pipeline(Readable.from(upstream.body), res, { signal: controller.signal });
       log({ event: "inference_complete", requestId, status: upstream.status, durationMs: Date.now() - started });
     } catch (error) {
+      if (isWarmup && timedOut && !res.destroyed && !res.headersSent) {
+        log({ event: "warmup_pending", requestId, reason: "health_timeout", durationMs: Date.now() - started });
+        warming();
+        return;
+      }
       const failure = error instanceof RequestError ? error
-        : timedOut ? new RequestError(504, "upstream_timeout", "Model response timed out; a cold start may still be in progress")
+        : timedOut ? new RequestError(504, "upstream_timeout", "Model response timed out; use the authenticated /warmup endpoint before retrying after a cold start")
         : new RequestError(502, "upstream_unavailable", "Model connection failed or was interrupted");
       log({
         event: "request_failed", requestId, status: failure.status, code: failure.code,

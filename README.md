@@ -20,7 +20,10 @@ Coding client --HTTPS/Bearer key--> Public CPU gateway
 - Constant-time comparison of hashed bearer keys; missing configuration fails startup.
 - No backend connection on startup, rejected authentication, health probes, model
   discovery, unsupported routes, invalid JSON, or local limit failures.
-- Only `POST /v1/chat/completions` and `POST /v1/completions` are forwarded.
+- Only `POST /v1/chat/completions` and `POST /v1/completions` forward inference.
+- Explicit, authenticated `POST /warmup` checks only the backend `/health`.
+  It can wake the GPU but never generates tokens; it shares inference rate and
+  concurrency limits. It is never called automatically by local health/discovery.
 - `GET /v1/models` requires authentication and returns the configured model locally.
 - Public `/healthz` and `/readyz` only check that the gateway is running. They do
   **not** assert that the model is loaded, reachable, or correctly configured.
@@ -37,8 +40,8 @@ Coding client --HTTPS/Bearer key--> Public CPU gateway
 - Workflow-time model transfer from Hugging Face into Azure Files, using bounded
   4 MiB ranges, exact size/SHA-256 verification, and a verified-file cache.
 
-The 65,536-token context includes input and output. GPU memory and prompt latency
-at this size still need a live test. The gateway's 1 MiB body limit, 4096-output-token
+The 65,536-token context includes input and output. Full-context inference memory
+and prompt latency still need a live test. The gateway's 1 MiB body limit, 4096-output-token
 limit, and 210-second upstream timeout are unchanged; some large prompts may hit
 these limits before filling the model's context window.
 
@@ -88,7 +91,8 @@ loopback development only; Azure ingress is HTTPS-only.
 
 **Nothing is deployed just by building or testing this project.** The commands
 below create billable resources. Review the pricing and template before running.
-No Azure deployment or GPU inference has yet been validated by this project.
+Local tests do not prove Azure ingress, scaling, or inference behavior. Validate
+the deployed environment using the live checks below.
 
 ### Prerequisites
 
@@ -266,8 +270,9 @@ Do not treat a passing local test as proof of Azure ingress/scaling behavior:
 4. Send missing/incorrect keys to gateway inference and check for `401`.
 5. Call `/healthz`, `/readyz`, and authenticated `/v1/models`.
 6. Confirm the **model replica count stayed zero** throughout these requests.
-7. Send one authorized chat request and observe the model wake and CUDA load.
-8. Verify a streamed response, then confirm the model eventually scales down.
+7. Run the authenticated warmup below and observe the model wake and CUDA load.
+8. Send an authorized chat request, verify a streamed response, then confirm the
+   model eventually scales down after the idle cooldown.
 
 Example request after obtaining the gateway domain from deployment outputs:
 
@@ -275,6 +280,9 @@ Example request after obtaining the gateway domain from deployment outputs:
 $base = 'https://<gateway-domain>'
 $headers = @{ Authorization = "Bearer $env:GATEWAY_API_KEY" }
 Invoke-RestMethod "$base/v1/models" -Headers $headers
+$env:GATEWAY_BASE_URL = "$base/v1"
+node .\scripts\warmup.mjs
+if ($LASTEXITCODE -ne 0) { throw 'Model warmup failed; inspect logs before sending inference' }
 $body = @{
   model = 'qwen3.8-27b'
   messages = @(@{ role = 'user'; content = 'Write a TypeScript sum function.' })
@@ -285,6 +293,41 @@ Invoke-RestMethod "$base/v1/chat/completions" -Method Post -Headers $headers -Co
 
 Your coding client uses base URL `https://<gateway-domain>/v1`, the **gateway**
 key, and model `qwen3.8-27b`. Never configure a client with the backend key.
+
+### Warm up before a coding session
+
+After an idle scale-down, run [scripts/warmup.mjs](scripts/warmup.mjs) with
+`GATEWAY_BASE_URL=https://<gateway-domain>/v1` and `GATEWAY_API_KEY` in the
+environment. This works from your Mac or Windows with Node.js 22+. Do not put
+the key in command arguments or commit it to a file.
+
+The script sends authenticated `POST /warmup` requests with JSON `{}` and waits
+up to **9 minutes**. Each backend health request is capped at **10 seconds**:
+
+- `200 {"status":"ready"}` means the backend health endpoint returned HTTP 200.
+- `202 {"status":"warming"}`, with `Retry-After: 5`, means health is still
+  unavailable (HTTP 502/503/504 or timeout). This is not a successful startup.
+- Authentication, unexpected responses, network failures, and the overall
+  deadline fail explicitly. Inspect logs rather than retrying indefinitely.
+
+Warmup is an intentional, billable GPU activation. It does not submit inference,
+keep the model running indefinitely, grant Azure management access, or increase
+minimum replicas. Invalid keys/bodies and unsupported route variants never
+contact the model. The existing `/healthz`, `/readyz`, and `/v1/models` remain
+entirely local.
+
+The model's **600-second idle cooldown** gives multi-minute initialization time
+to finish even between bounded warmup requests. It also keeps a loaded replica
+billable for roughly 10 idle minutes; platform scheduling can affect the exact
+scale-down time. Minimum/maximum replicas remain **0/1**. Re-run warmup after
+another idle scale-down. Coding clients do not automatically call this custom
+endpoint: warm the model before connecting/sending their first inference.
+
+The gateway's **210-second inference deadline is unchanged**. A cold request may
+outlast it; increasing a single request beyond Container Apps' HTTP ceiling is
+not a reliable fix. Warmup handles startup separately without replaying prompts.
+A successful health check proves loading, not full-context inference quality
+or tool-call compatibility.
 
 ## GitHub Actions deployment
 
@@ -460,7 +503,8 @@ can restart the model, cause a brief interruption, and incur GPU initialization
 charges. Cancellation or failure is not an automatic rollback.
 
 After deployment, it verifies internal model/public gateway ingress, HTTPS-only
-access, replica limits, and readiness of the exact new revisions. It then runs
+access, replica limits, the expected latest revisions, and gateway revision
+readiness. It then runs
 [scripts/smoke.mjs](scripts/smoke.mjs):
 
 - Gateway-local health and readiness.
@@ -468,9 +512,20 @@ access, replica limits, and readiness of the exact new revisions. It then runs
 - Missing/invalid credentials rejected with `401` on a deliberately unsupported
   path, so even an authentication regression cannot make this check send inference.
 
+The workflow then runs [scripts/warmup.mjs](scripts/warmup.mjs) and
+[scripts/verify-model-ready.ps1](scripts/verify-model-ready.ps1). Deployment
+succeeds only after backend health responds successfully and the **exact deployed
+model revision** is active, reports `Healthy`, and has a running replica.
+`latestReadyRevisionName` alone is not sufficient: Azure can populate it before
+the model has loaded. Warmup and revision polling each have a nine-minute bound;
+the combined step has a 20-minute hard limit.
+
 The Actions summary contains the gateway base URL and both image digests, not
-keys. No inference request is sent by these smoke checks; **deployment itself
-can still wake the GPU**. Actual model inference, direct-ingress isolation,
+keys. No inference request is sent, but **full deployments now deliberately wake
+the GPU to verify startup**, followed by the billable idle cooldown. Bootstrap-only
+still skips this check. A failed check does not disable scale-to-zero or leave
+a minimum-one override; it also does not immediately stop an existing replica.
+Actual model inference, direct-ingress isolation,
 absence of public environment routes, and observed zero replicas during rejected
 traffic still require the live checks in Azure deployment step 4.
 
@@ -491,12 +546,19 @@ failure stopped them.
   durable quotas or a hard spending cap. With additional replicas or overlapping
   revisions, aggregate limits increase. A stolen valid key can keep one A100 busy.
 - Backend readiness probes are local to the GPU replica; the gateway never probes
-  it. Scaling cooldown is platform-controlled and GPU charges continue while a
-  replica remains running, including idle and initialization time.
+  it automatically. Only explicit authenticated warmup requests check backend
+  health. Scaling cooldown is platform-controlled and GPU charges continue while
+  a replica remains running, including idle and initialization time.
+- Serverless GPU Consumption is **billed per second**, not rounded up to a whole
+  hour. An hourly price is a rate, not an obligation to pay a full hour per start.
+  Keeping `minReplicas: 1` incurs continuing compute charges; retain zero for
+  intermittent use. Storage, ACR, logging, and other resources can still cost
+  money at zero GPU replicas. See the
+  [serverless GPU billing overview](https://learn.microsoft.com/azure/container-apps/gpu-serverless-overview).
 - The upstream timeout is 210 seconds total, including stream duration, to stay
   below the common Container Apps HTTP request ceiling of 240 seconds. A long
   model load can outlast it. A `504` does not prove the GPU stopped. This gateway
-  never retries automatically; after observing readiness, retry manually. If
+  never retries inference automatically; run warmup and then retry manually. If
   multi-minute cold starts or long agent streams are frequent, reconsider this
   synchronous serverless architecture (warm service or an asynchronous job API).
 - If a stream fails after headers were sent, the connection is terminated rather
