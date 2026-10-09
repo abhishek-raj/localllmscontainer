@@ -4,13 +4,19 @@ import { pathToFileURL } from "node:url";
 import { ShareClient, StorageSharedKeyCredential, RestError } from "@azure/storage-file-share";
 
 export const RANGE_BYTES = 4 * 1024 * 1024;
-export interface ModelManifest {
+export interface ModelFile {
   repository: string;
   revision: string;
+  /** Name on the Azure Files share (flat). */
   fileName: string;
+  /** Path inside the Hugging Face repository; may include subdirectories. */
+  sourcePath: string;
   sizeBytes: number;
   sha256: string;
+}
+export interface ModelManifest extends ModelFile {
   contextTokens: number;
+  mtp: ModelFile;
 }
 
 interface Properties {
@@ -29,24 +35,43 @@ export interface ModelStore {
 
 export class TransferError extends Error {}
 
+function isFileEntry(value: unknown): value is { fileName: string; sizeBytes: number; sha256: string } {
+  return !!value && typeof value === "object" &&
+    "fileName" in value && typeof value.fileName === "string" && /^[\w-][\w.-]*\.gguf$/.test(value.fileName) &&
+    "sizeBytes" in value && typeof value.sizeBytes === "number" &&
+    Number.isSafeInteger(value.sizeBytes) && value.sizeBytes >= 1 &&
+    "sha256" in value && typeof value.sha256 === "string" && /^[a-f0-9]{64}$/.test(value.sha256);
+}
+
+// Every segment starts with a word character, so "..", hidden names, and absolute paths are rejected.
+const SOURCE_PATH = /^(?:[\w-][\w.-]*\/)*[\w-][\w.-]*\.gguf$/;
+
 export function parseManifest(value: unknown): ModelManifest {
+  const invalid = () => new TransferError(
+    "Invalid model.json: require pinned revision, safe GGUF filenames, exact sizes/SHA-256 for the model and its MTP head, and valid context.",
+  );
   if (!value || typeof value !== "object" ||
     !("repository" in value) || typeof value.repository !== "string" ||
     !/^[\w-]+\/[\w.-]+$/.test(value.repository) ||
     !("revision" in value) || typeof value.revision !== "string" || !/^[a-f0-9]{40}$/.test(value.revision) ||
-    !("fileName" in value) || typeof value.fileName !== "string" || !/^[\w.-]+\.gguf$/.test(value.fileName) ||
-    value.fileName.startsWith(".") ||
-    !("sizeBytes" in value) || typeof value.sizeBytes !== "number" ||
-    !Number.isSafeInteger(value.sizeBytes) || value.sizeBytes < 1 ||
-    !("sha256" in value) || typeof value.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.sha256) ||
+    !isFileEntry(value) ||
     !("contextTokens" in value) || typeof value.contextTokens !== "number" ||
-    !Number.isSafeInteger(value.contextTokens) || value.contextTokens < 1024 || value.contextTokens > 262144
+    !Number.isSafeInteger(value.contextTokens) || value.contextTokens < 1024 || value.contextTokens > 262144 ||
+    !("mtp" in value) || !isFileEntry(value.mtp) ||
+    !("sourcePath" in value.mtp) || typeof value.mtp.sourcePath !== "string" || !SOURCE_PATH.test(value.mtp.sourcePath) ||
+    value.mtp.sourcePath.split("/").at(-1) !== value.mtp.fileName ||
+    value.mtp.fileName === value.fileName
   ) {
-    throw new TransferError("Invalid model.json: require pinned revision, safe GGUF filename, exact size/SHA-256, and valid context.");
+    throw invalid();
   }
+  const { repository, revision } = value;
   return {
-    repository: value.repository, revision: value.revision, fileName: value.fileName,
+    repository, revision, fileName: value.fileName, sourcePath: value.fileName,
     sizeBytes: value.sizeBytes, sha256: value.sha256, contextTokens: value.contextTokens,
+    mtp: {
+      repository, revision, fileName: value.mtp.fileName, sourcePath: value.mtp.sourcePath,
+      sizeBytes: value.mtp.sizeBytes, sha256: value.mtp.sha256,
+    },
   };
 }
 
@@ -147,14 +172,14 @@ async function receiptMatches(store: ModelStore, name: string, expected: string)
   return Buffer.concat(chunks).toString("utf8") === expected;
 }
 
-function receipt(manifest: ModelManifest, properties: Properties): string {
+function receipt(manifest: ModelFile, properties: Properties): string {
   return JSON.stringify({
     sha256: manifest.sha256, sizeBytes: manifest.sizeBytes, revision: manifest.revision,
     repository: manifest.repository, fileName: manifest.fileName, etag: properties.etag,
   });
 }
 
-async function saveReceipt(store: ModelStore, manifest: ModelManifest, properties: Properties | undefined, log: Log): Promise<void> {
+async function saveReceipt(store: ModelStore, manifest: ModelFile, properties: Properties | undefined, log: Log): Promise<void> {
   if (!properties || properties.size !== manifest.sizeBytes) {
     throw new TransferError("Published model is missing or has an unexpected size.");
   }
@@ -169,7 +194,7 @@ async function saveReceipt(store: ModelStore, manifest: ModelManifest, propertie
   }
 }
 
-async function hashStream(source: AsyncIterable<Uint8Array>, manifest: ModelManifest): Promise<void> {
+async function hashStream(source: AsyncIterable<Uint8Array>, manifest: ModelFile): Promise<void> {
   const hash = createHash("sha256");
   let size = 0;
   for await (const chunk of source) {
@@ -183,7 +208,7 @@ async function hashStream(source: AsyncIterable<Uint8Array>, manifest: ModelMani
 }
 
 export async function ensureModel(
-  manifest: ModelManifest,
+  manifest: ModelFile,
   store: ModelStore,
   openSource: (url: string) => Promise<AsyncIterable<Uint8Array>>,
   log: Log = logger,
@@ -205,7 +230,7 @@ export async function ensureModel(
     return "verified";
   }
 
-  const url = `https://huggingface.co/${manifest.repository}/resolve/${manifest.revision}/${manifest.fileName}`;
+  const url = `https://huggingface.co/${manifest.repository}/resolve/${manifest.revision}/${manifest.sourcePath}`;
   const temporary = `${manifest.fileName}.${randomUUID()}.partial`;
   let offset = 0;
   const hash = createHash("sha256");
@@ -244,7 +269,8 @@ async function main(): Promise<void> {
     throw new TransferError("STORAGE_ACCOUNT_NAME and AZURE_STORAGE_KEY must be set for the model transfer.");
   }
   const signal = AbortSignal.timeout(90 * 60 * 1000);
-  await ensureModel(manifest, azureStore(account, key, signal), async (url) => {
+  const store = azureStore(account, key, signal);
+  const openSource = (file: ModelFile) => async (url: string) => {
     const response = await fetch(url, {
       headers: { "accept-encoding": "identity" },
       signal,
@@ -254,12 +280,15 @@ async function main(): Promise<void> {
       throw new TransferError(`Model download returned HTTP ${response.status}.`);
     }
     const length = response.headers.get("content-length");
-    if (length && Number(length) !== manifest.sizeBytes) {
+    if (length && Number(length) !== file.sizeBytes) {
       await response.body.cancel();
       throw new TransferError("Model source Content-Length does not match model.json.");
     }
     return response.body;
-  });
+  };
+  for (const file of [manifest, manifest.mtp]) {
+    await ensureModel(file, store, openSource(file));
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

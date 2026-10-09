@@ -29,6 +29,12 @@ param modelAlias string = 'qwen3.8-27b'
 @maxValue(262144)
 param contextTokens int
 
+@description('Supplied from model.json by main.bicepparam: MTP draft head stored next to the model.')
+param mtpFile string
+
+@description('Use the MTP head for speculative decoding. Flip without a workflow run: az containerapp update --set-env-vars MTP_ENABLED=false (restarts the model container).')
+param mtpEnabled bool = true
+
 @description('Optional unique suffix to create fresh revisions of both apps, including after secret rotation.')
 @maxLength(50)
 param deploymentRevision string = ''
@@ -51,6 +57,28 @@ resource pullIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-
   name: identityName
 }
 
+// llama.cpp loads any configured draft model, so both speculative settings must be set or unset together.
+// This wrapper derives them from the single MTP_ENABLED flag when the container starts.
+var modelEntrypoint = '''
+set -eu
+case "$(printf '%s' "${MTP_ENABLED:-}" | tr 'A-Z' 'a-z')" in
+  true)
+    export LLAMA_ARG_SPEC_TYPE=draft-mtp
+    export LLAMA_ARG_SPEC_DRAFT_MODEL="$MTP_MODEL_PATH"
+    echo "MTP speculative decoding: enabled ($MTP_MODEL_PATH)"
+    ;;
+  false)
+    unset LLAMA_ARG_SPEC_TYPE LLAMA_ARG_SPEC_DRAFT_MODEL
+    echo "MTP speculative decoding: disabled"
+    ;;
+  *)
+    echo "MTP_ENABLED must be true or false" >&2
+    exit 64
+    ;;
+esac
+exec /app/llama-server
+'''
+
 resource model 'Microsoft.App/containerApps@2025-01-01' = {
   name: modelAppName
   location: location
@@ -72,9 +100,12 @@ resource model 'Microsoft.App/containerApps@2025-01-01' = {
       containers: [{
         name: 'model'
         image: modelImage
+        command: ['/bin/sh', '-c', modelEntrypoint]
         resources: { cpu: 24, memory: '220Gi' }
         env: [
           { name: 'LLAMA_ARG_MODEL', value: '/models/${modelFile}' }
+          { name: 'MTP_ENABLED', value: mtpEnabled ? 'true' : 'false' }
+          { name: 'MTP_MODEL_PATH', value: '/models/${mtpFile}' }
           { name: 'LLAMA_ARG_ALIAS', value: modelAlias }
           { name: 'LLAMA_ARG_HOST', value: '0.0.0.0' }
           { name: 'LLAMA_ARG_PORT', value: '8080' }

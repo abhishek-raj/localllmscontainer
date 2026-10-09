@@ -82,6 +82,7 @@ jobs:
       STORAGE_ACCOUNT_NAME: ${{ vars.STORAGE_ACCOUNT_NAME }}
       GPU_PROFILE_NAME: ${{ vars.GPU_PROFILE_NAME }}
       MODEL_IMAGE: ${{ vars.MODEL_IMAGE }}
+      MTP_ENABLED: ${{ vars.MTP_ENABLED }}
       DEPLOYMENT_REVISION: gh-${{ github.run_id }}-${{ github.run_attempt }}
       BOOTSTRAP_ONLY: ${{ inputs.bootstrap_only }}
     steps:
@@ -117,6 +118,9 @@ jobs:
           }
           if ($env:MODEL_IMAGE -cnotmatch '^ghcr\.io/ggml-org/llama\.cpp@sha256:[a-f0-9]{64}$') {
             throw 'MODEL_IMAGE must pin the official llama.cpp CUDA server image by digest'
+          }
+          if (-not [string]::IsNullOrWhiteSpace($env:MTP_ENABLED) -and $env:MTP_ENABLED -notin @('true', 'false')) {
+            throw 'MTP_ENABLED must be true, false, or unset (unset means true)'
           }
           npm ci
           if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
@@ -183,6 +187,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Model transfer or verification failed; app deployment blocked' }
             $model = Get-Content .\model.json -Raw | ConvertFrom-Json
             "Model file verified: $($model.fileName)" >> $env:GITHUB_STEP_SUMMARY
+            "MTP draft head verified: $($model.mtp.fileName)" >> $env:GITHUB_STEP_SUMMARY
             "Context window: $($model.contextTokens) tokens" >> $env:GITHUB_STEP_SUMMARY
           } finally {
             if (Test-Path Env:\AZURE_STORAGE_KEY) { Remove-Item Env:\AZURE_STORAGE_KEY }
@@ -244,6 +249,7 @@ jobs:
           "Gateway base URL: not shown, because run summaries are public in public repositories. To print it, run ``az containerapp show --name qwen-gateway --resource-group <resource-group> --query properties.configuration.ingress.fqdn -o tsv`` and append ``/v1``." >> $env:GITHUB_STEP_SUMMARY
           "Gateway image: $env:GATEWAY_IMAGE" >> $env:GITHUB_STEP_SUMMARY
           "Model image: $env:MODEL_IMAGE" >> $env:GITHUB_STEP_SUMMARY
+          "MTP speculative decoding: $(if ($env:MTP_ENABLED -eq 'false') { 'disabled' } else { 'enabled' })" >> $env:GITHUB_STEP_SUMMARY
           "Health, local discovery, and rejected-auth checks passed. No inference request was sent." >> $env:GITHUB_STEP_SUMMARY
       - name: Warm model and verify exact revision health
         if: ${{ !inputs.bootstrap_only }}

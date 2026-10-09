@@ -38,6 +38,10 @@ Coding client --HTTPS/Bearer key--> Public CPU gateway
 - Pinned **Qwen3.8-27B UD-Q4_K_M (4-bit)** with a **262,144-token context** (the
   model's native maximum), served by three parallel llama.cpp slots that share one
   unified KV cache. [model.json](model.json) is shared by the model downloader and Bicep parameters.
+- **MTP speculative decoding** using the model's own multi-token-prediction draft head
+  (`mtp-Qwen3.8-27B-Q4_0.gguf`, about 1.37 GB, pinned in [model.json](model.json)).
+  On by default; it speeds up token generation only. See
+  [Turning MTP on or off](#turning-mtp-speculative-decoding-on-or-off).
 - Workflow-time model transfer from Hugging Face into Azure Files, using bounded
   4 MiB ranges, exact size/SHA-256 verification, and a verified-file cache.
 
@@ -157,10 +161,13 @@ The workflow automatically transfers `Qwen3.8-27B-UD-Q4_K_M.gguf` from
 [the Unsloth repository](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) using
 the immutable revision, size, and SHA-256 recorded in [model.json](model.json).
 This is the **dynamic** Q4_K_M variant, approximately 16.46 GB (15.33 GiB).
-Review its license and source before deployment. The file never passes through
-your computer or gets fully buffered on the runner's disk.
+The same pinned revision's `MTP/mtp-Qwen3.8-27B-Q4_0.gguf` draft head (about
+1.37 GB) is transferred and verified the same way and stored at the share root as
+`mtp-Qwen3.8-27B-Q4_0.gguf`.
+Review its license and source before deployment. The files never pass through
+your computer or get fully buffered on the runner's disk.
 
-For a local CLI deployment, you can either upload the file manually to the root
+For a local CLI deployment, you can either upload both files manually to the root
 of the `models` share or invoke the same downloader after bootstrap:
 
 ```powershell
@@ -179,7 +186,8 @@ try {
 
 Running that command **locally** uses your machine's bandwidth. Prefer GitHub
 Actions to keep the transfer off your computer. To change the model in the
-workflow, update the manifest's filename, revision, size, and hash together.
+workflow, update the manifest's filename, revision, size, and hash together,
+including the `mtp` entry (`sourcePath` is its path inside the Hugging Face repository).
 Changing `MODEL_IMAGE` changes only the serving runtime, not the weights.
 
 **Complete the upload before deploying the GPU app.** The app loads from
@@ -218,6 +226,12 @@ $env:MODEL_IMAGE = 'ghcr.io/ggml-org/llama.cpp@sha256:<digest-for-server-cuda>'
 If Docker is available, `docker buildx imagetools inspect ghcr.io/ggml-org/llama.cpp:server-cuda`
 shows the current digest. Do not copy the placeholder above unchanged.
 Pinning is not a substitute for applying tested security updates.
+
+MTP speculative decoding needs a llama.cpp build that has `draft-mtp` and the
+`LLAMA_ARG_SPEC_TYPE`/`LLAMA_ARG_SPEC_DRAFT_MODEL` settings (added from May 2026,
+starting with ggml-org/llama.cpp#22673). With an older image, deploy with
+`MTP_ENABLED=false` or update the digest. The model app runs llama-server through
+a small `/bin/sh` wrapper, so the image must keep the official `/app/llama-server` path.
 
 ### 3. Set distinct secrets and deploy both apps
 
@@ -422,6 +436,7 @@ Add these **environment variables** (not secrets):
 | `STORAGE_ACCOUNT_NAME` | Globally unique model storage account name: 3-24 lowercase letters/digits |
 | `GPU_PROFILE_NAME` | Existing profile name whose type is `Consumption-GPU-NC24-A100` |
 | `MODEL_IMAGE` | `ghcr.io/ggml-org/llama.cpp@sha256:<64-character-digest>` for the CUDA server |
+| `MTP_ENABLED` | Optional. `true` (default when unset) or `false`; the MTP setting each deployment applies |
 
 Add these **environment secrets**:
 
@@ -582,6 +597,34 @@ failure stopped them.
 - Check gateway structured logs for `request_failed`, `upstream_rejected`, and
   `inference_complete`; use request IDs, not sensitive prompts, for correlation.
   Inspect llama.cpp and platform logging separately for prompt/privacy exposure.
+
+### Turning MTP speculative decoding on or off
+
+The model app reads one flag, `MTP_ENABLED` (`true`/`false`), when its container
+starts. A wrapper turns it into llama.cpp's `LLAMA_ARG_SPEC_TYPE=draft-mtp` and
+`LLAMA_ARG_SPEC_DRAFT_MODEL` settings, which must be set or cleared together.
+Current llama.cpp ignores per-request speculative settings, so the gateway cannot
+switch MTP per request.
+
+Flip it without running the workflow, rebuilding, or re-downloading anything:
+
+```powershell
+az containerapp update --name qwen-model --resource-group $rg --set-env-vars MTP_ENABLED=false
+# Turn it back on:
+az containerapp update --name qwen-model --resource-group $rg --set-env-vars MTP_ENABLED=true
+```
+
+Each change creates a new model revision and **restarts the GPU container**: the
+next request is a cold start, so run warmup afterward. The model log shows
+`MTP speculative decoding: enabled` or `disabled` at startup, and llama.cpp logs
+`draft acceptance = ...` after each request when MTP is active.
+
+The next workflow deployment reapplies the `MTP_ENABLED` GitHub variable (unset
+means `true`). Set that variable too if the change should persist.
+
+MTP only speeds up token generation. It does not change cold starts or prompt
+processing, and gains depend on how often drafts are accepted. Turn it off if
+outputs or stability regress, or if the model fails to start after an image change.
 
 ## Validation
 

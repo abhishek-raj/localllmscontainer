@@ -11,3 +11,6 @@ param backendApiKey = readEnvironmentVariable('BACKEND_API_KEY')
 param deploymentRevision = readEnvironmentVariable('DEPLOYMENT_REVISION', '')
 param modelFile = loadJsonContent('../model.json', 'fileName')
 param contextTokens = loadJsonContent('../model.json', 'contextTokens')
+param mtpFile = loadJsonContent('../model.json', 'mtp.fileName')
+// Unset or empty means enabled; the workflow rejects values other than true/false.
+param mtpEnabled = toLower(readEnvironmentVariable('MTP_ENABLED', 'true')) != 'false'

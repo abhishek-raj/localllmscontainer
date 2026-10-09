@@ -65,6 +65,12 @@ function manifestFor(bytes: Buffer): ModelManifest {
     sizeBytes: bytes.length,
     sha256: createHash("sha256").update(bytes).digest("hex"),
     contextTokens: 65536,
+    mtp: {
+      fileName: "mtp-test.gguf",
+      sourcePath: "MTP/mtp-test.gguf",
+      sizeBytes: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    },
   });
 }
 
@@ -74,11 +80,43 @@ test("model manifest pins the four-bit file, digest, revision, and 262144 contex
   const manifest = parseManifest(JSON.parse(await readFile(new URL("../../model.json", import.meta.url), "utf8")));
   assert.equal(manifest.contextTokens, 262144);
   assert.equal(manifest.fileName, "Qwen3.8-27B-UD-Q4_K_M.gguf");
+  assert.equal(manifest.sourcePath, manifest.fileName);
   assert.equal(manifest.sizeBytes, 16464440224);
   for (const override of [
     { revision: "main" }, { fileName: "../escape.gguf" }, { sha256: "bad" },
-    { sizeBytes: -1 }, { contextTokens: 0 }, { repository: "https://elsewhere" },
+    { sizeBytes: -1 }, { contextTokens: 0 }, { repository: "https://elsewhere" }, { mtp: undefined },
   ]) assert.throws(() => parseManifest({ ...manifest, ...override }), /Invalid model.json/);
+});
+
+test("model manifest pins the MTP draft head from the same revision", async () => {
+  const manifest = parseManifest(JSON.parse(await readFile(new URL("../../model.json", import.meta.url), "utf8")));
+  assert.deepEqual(manifest.mtp, {
+    repository: manifest.repository,
+    revision: manifest.revision,
+    fileName: "mtp-Qwen3.8-27B-Q4_0.gguf",
+    sourcePath: "MTP/mtp-Qwen3.8-27B-Q4_0.gguf",
+    sizeBytes: 1369590656,
+    sha256: "50d9ce5a6da381bbcfb31061cf73df94a90e6faf8efeddee379a9cb8f1501c6e",
+  });
+  for (const mtp of [
+    { sourcePath: "../MTP/mtp-Qwen3.8-27B-Q4_0.gguf" }, { sourcePath: "/MTP/mtp-Qwen3.8-27B-Q4_0.gguf" },
+    { sourcePath: "MTP/../mtp-Qwen3.8-27B-Q4_0.gguf" }, { sourcePath: "MTP/other.gguf" },
+    { fileName: manifest.fileName, sourcePath: `MTP/${manifest.fileName}` }, { fileName: ".hidden.gguf", sourcePath: "MTP/.hidden.gguf" },
+    { sha256: "bad" }, { sizeBytes: 0 },
+  ]) assert.throws(() => parseManifest({ ...manifest, mtp: { ...manifest.mtp, ...mtp } }), /Invalid model.json/);
+});
+
+test("MTP head downloads from its repository subdirectory into a flat share name", async () => {
+  const data = Buffer.from("mtp head bytes");
+  const { mtp } = manifestFor(data);
+  const store = new MemoryStore();
+  const open = async (url: string) => {
+    assert.equal(url, `https://huggingface.co/test/model/resolve/${mtp.revision}/MTP/mtp-test.gguf`);
+    return chunks(data);
+  };
+  assert.equal(await ensureModel(mtp, store, open, quiet), "downloaded");
+  assert.deepEqual(store.files.get("mtp-test.gguf")?.data, data);
+  assert(store.files.has("mtp-test.gguf.verified.json"));
 });
 
 test("streamed download uses bounded ranges, validates bytes, publishes, and reuses receipt", async () => {
