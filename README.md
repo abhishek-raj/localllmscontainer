@@ -32,7 +32,8 @@ Coding client --HTTPS/Bearer key--> Public CPU gateway
 - Separate backend credentials; client headers, cookies, and backend error bodies
   are not forwarded indiscriminately. No request bodies or keys in application logs.
 - Deployed limits: 1 MiB body, three active inference/upload requests, 30 authenticated
-  inference attempts per minute, 4096 output tokens. `max_completion_tokens` is normalized
+  inference attempts per minute, 8192 output tokens (of which at most 4096 are thinking; see
+  [Thinking budget](#thinking-budget)). `max_completion_tokens` is normalized
   to `max_tokens`; unbounded values, `n_predict`, and `n > 1` are rejected.
 - Non-root Docker image and Bicep for a public CPU app and internal A100 app.
 - Pinned **Qwen3.8-27B UD-Q4_K_M (4-bit)** with a **262,144-token context** (the
@@ -47,8 +48,8 @@ Coding client --HTTPS/Bearer key--> Public CPU gateway
 
 The 262,144-token context includes input and output and is a shared pool: any one
 request can use all of it, but concurrent requests compete for it. Full-context inference memory
-and prompt latency still need a live test. The gateway's 1 MiB body limit, 4096-output-token
-limit, and 210-second upstream timeout are unchanged; large prompts will hit
+and prompt latency still need a live test. The gateway's 1 MiB body limit, 8192-output-token
+limit, and 210-second upstream timeout apply; large prompts will hit
 these limits well before filling the model's context window.
 
 This is a focused OpenAI **Chat Completions/Completions** proxy, not the entire
@@ -437,6 +438,7 @@ Add these **environment variables** (not secrets):
 | `GPU_PROFILE_NAME` | Existing profile name whose type is `Consumption-GPU-NC24-A100` |
 | `MODEL_IMAGE` | `ghcr.io/ggml-org/llama.cpp@sha256:<64-character-digest>` for the CUDA server |
 | `MTP_ENABLED` | Optional. `true` (default when unset) or `false`; the MTP setting each deployment applies |
+| `THINKING_BUDGET_TOKENS` | Optional. Thinking-token cap each deployment applies: `4096` when unset, `-1` for unlimited |
 
 Add these **environment secrets**:
 
@@ -625,6 +627,35 @@ means `true`). Set that variable too if the change should persist.
 MTP only speeds up token generation. It does not change cold starts or prompt
 processing, and gains depend on how often drafts are accepted. Turn it off if
 outputs or stability regress, or if the model fails to start after an image change.
+
+### Thinking budget
+
+Qwen3.8 thinks before answering, and thinking tokens count toward the output
+limit. Without a cap, long thinking can use the whole limit and leave a truncated
+answer or tool call. llama.cpp's `LLAMA_ARG_THINK_BUDGET` (default **4096**) stops
+thinking after that many tokens, adds a short note, and makes the model answer.
+With the gateway's 8192-token output limit, at least 4096 tokens remain for the answer.
+
+Change it without running the workflow (restarts the GPU container; run warmup afterward):
+
+```powershell
+az containerapp update --name qwen-model --resource-group $rg --set-env-vars LLAMA_ARG_THINK_BUDGET=2048
+# Unlimited thinking:
+az containerapp update --name qwen-model --resource-group $rg --set-env-vars LLAMA_ARG_THINK_BUDGET=-1
+```
+
+The next workflow deployment reapplies the `THINKING_BUDGET_TOKENS` GitHub variable
+(unset means 4096). A request can still set its own `thinking_budget_tokens`.
+
+Output size is bounded by time as well as tokens. Azure Container Apps ends HTTP
+requests at 240 seconds, so the gateway stops each request at 210 seconds,
+including streaming. At roughly 60 tokens per second for one request, 8192 tokens
+plus prompt processing fits; with several requests running at once, each one is
+slower and long responses can still hit the timeout. Lower the thinking budget if
+that happens often.
+
+Match the client's output limit to the gateway's. A client that sends `max_tokens`
+above 8192 gets HTTP 400; in VS Code, set `maxOutputTokens` to 8192 for this model.
 
 ## Validation
 

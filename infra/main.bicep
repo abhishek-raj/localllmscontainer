@@ -35,6 +35,15 @@ param mtpFile string
 @description('Use the MTP head for speculative decoding. Flip without a workflow run: az containerapp update --set-env-vars MTP_ENABLED=false (restarts the model container).')
 param mtpEnabled bool = true
 
+@description('Maximum thinking tokens per response before llama.cpp forces the answer; -1 means unlimited. Flip without a workflow run: az containerapp update --set-env-vars LLAMA_ARG_THINK_BUDGET=<n> (restarts the model container).')
+@minValue(-1)
+param thinkingBudgetTokens int = 4096
+
+@description('Largest max_tokens the gateway accepts and its default when a request sets none. Must be below the model context.')
+@minValue(1)
+@maxValue(32768)
+param maxOutputTokens int = 8192
+
 @description('Optional unique suffix to create fresh revisions of both apps, including after secret rotation.')
 @maxLength(50)
 param deploymentRevision string = ''
@@ -114,6 +123,8 @@ resource model 'Microsoft.App/containerApps@2025-01-01' = {
           { name: 'LLAMA_ARG_CTX_SIZE', value: string(contextTokens) }
           { name: 'LLAMA_ARG_N_PARALLEL', value: '3' }
           { name: 'LLAMA_ARG_KV_UNIFIED', value: 'true' }
+          { name: 'LLAMA_ARG_THINK_BUDGET', value: string(thinkingBudgetTokens) }
+          { name: 'LLAMA_ARG_THINK_BUDGET_MESSAGE', value: '\n\nI have reached my thinking budget, so I will answer now.\n' }
           { name: 'LLAMA_ARG_JINJA', value: 'true' }
           { name: 'LLAMA_API_KEY', secretRef: 'backend-api-key' }
         ]
@@ -195,7 +206,7 @@ resource gateway 'Microsoft.App/containerApps@2025-01-01' = {
           { name: 'MAX_BODY_BYTES', value: '1048576' }
           { name: 'MAX_CONCURRENT_REQUESTS', value: '3' }
           { name: 'REQUESTS_PER_MINUTE', value: '30' }
-          { name: 'MAX_OUTPUT_TOKENS', value: '4096' }
+          { name: 'MAX_OUTPUT_TOKENS', value: string(maxOutputTokens) }
           { name: 'UPSTREAM_TIMEOUT_MS', value: '210000' }
         ]
         probes: [

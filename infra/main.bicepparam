@@ -14,3 +14,5 @@ param contextTokens = loadJsonContent('../model.json', 'contextTokens')
 param mtpFile = loadJsonContent('../model.json', 'mtp.fileName')
 // Unset or empty means enabled; the workflow rejects values other than true/false.
 param mtpEnabled = toLower(readEnvironmentVariable('MTP_ENABLED', 'true')) != 'false'
+// Unset or empty means 4096; the workflow rejects values that aren't integers >= -1.
+param thinkingBudgetTokens = empty(readEnvironmentVariable('THINKING_BUDGET_TOKENS', '')) ? 4096 : int(readEnvironmentVariable('THINKING_BUDGET_TOKENS', '4096'))
