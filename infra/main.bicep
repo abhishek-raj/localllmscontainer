@@ -59,6 +59,7 @@ resource pullIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-
 
 // llama.cpp loads any configured draft model, so both speculative settings must be set or unset together.
 // This wrapper derives them from the single MTP_ENABLED flag when the container starts.
+// Windows checkouts give this string CRLF line endings; the command strips CR because /bin/sh rejects it.
 var modelEntrypoint = '''
 set -eu
 case "$(printf '%s' "${MTP_ENABLED:-}" | tr 'A-Z' 'a-z')" in
@@ -100,7 +101,7 @@ resource model 'Microsoft.App/containerApps@2025-01-01' = {
       containers: [{
         name: 'model'
         image: modelImage
-        command: ['/bin/sh', '-c', modelEntrypoint]
+        command: ['/bin/sh', '-c', replace(modelEntrypoint, '\r', '')]
         resources: { cpu: 24, memory: '220Gi' }
         env: [
           { name: 'LLAMA_ARG_MODEL', value: '/models/${modelFile}' }
