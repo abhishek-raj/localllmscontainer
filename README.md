@@ -32,7 +32,7 @@ Coding client --HTTPS/Bearer key--> Public CPU gateway
 - Separate backend credentials; client headers, cookies, and backend error bodies
   are not forwarded indiscriminately. No request bodies or keys in application logs.
 - Deployed limits: 1 MiB body, three active inference/upload requests, 30 authenticated
-  inference attempts per minute, 8192 output tokens (of which at most 4096 are thinking; see
+  inference attempts per minute, 32768 output tokens (of which at most 8192 are thinking; see
   [Thinking budget](#thinking-budget)). `max_completion_tokens` is normalized
   to `max_tokens`; unbounded values, `n_predict`, and `n > 1` are rejected.
 - Non-root Docker image and Bicep for a public CPU app and internal A100 app.
@@ -48,8 +48,8 @@ Coding client --HTTPS/Bearer key--> Public CPU gateway
 
 The 262,144-token context includes input and output and is a shared pool: any one
 request can use all of it, but concurrent requests compete for it. Full-context inference memory
-and prompt latency still need a live test. The gateway's 1 MiB body limit, 8192-output-token
-limit, and 210-second upstream timeout apply; large prompts will hit
+and prompt latency still need a live test. The gateway's 1 MiB body limit, 32768-output-token
+limit, and idle-based upstream timeout apply; large prompts will hit
 these limits well before filling the model's context window.
 
 This is a focused OpenAI **Chat Completions/Completions** proxy, not the entire
@@ -438,7 +438,7 @@ Add these **environment variables** (not secrets):
 | `GPU_PROFILE_NAME` | Existing profile name whose type is `Consumption-GPU-NC24-A100` |
 | `MODEL_IMAGE` | `ghcr.io/ggml-org/llama.cpp@sha256:<64-character-digest>` for the CUDA server |
 | `MTP_ENABLED` | Optional. `true` (default when unset) or `false`; the MTP setting each deployment applies |
-| `THINKING_BUDGET_TOKENS` | Optional. Thinking-token cap each deployment applies: `4096` when unset, `-1` for unlimited |
+| `THINKING_BUDGET_TOKENS` | Optional. Thinking-token cap each deployment applies: `8192` when unset, `-1` for unlimited |
 
 Add these **environment secrets**:
 
@@ -577,11 +577,16 @@ failure stopped them.
   intermittent use. Storage, ACR, logging, and other resources can still cost
   money at zero GPU replicas. See the
   [serverless GPU billing overview](https://learn.microsoft.com/azure/container-apps/gpu-serverless-overview).
-- The upstream timeout is 210 seconds total, including stream duration, to stay
-  below the common Container Apps HTTP request ceiling of 240 seconds. A long
-  model load can outlast it. A `504` does not prove the GPU stopped. This gateway
+- The upstream timeout is **idle-based**: a response is cut after 210 seconds without
+  a byte, not after a fixed total duration, so a steadily streaming answer may run for
+  many minutes. A separate 30-minute total cap bounds a stream that never ends. This
+  matches Container Apps ingress, which measures idle time rather than wall-clock
+  duration (see [Request timeouts](#request-timeouts)). **Long generations require
+  `stream: true`**; a non-streamed response sends nothing until it is complete, so it
+  is bounded by the idle limit. A long model load can still outlast that limit.
+  A `504` does not prove the GPU stopped. This gateway
   never retries inference automatically; run warmup and then retry manually. If
-  multi-minute cold starts or long agent streams are frequent, reconsider this
+  multi-minute cold starts are frequent, reconsider this
   synchronous serverless architecture (warm service or an asynchronous job API).
 - If a stream fails after headers were sent, the connection is terminated rather
   than returning a false successful completion. Clients must handle interruptions.
@@ -632,30 +637,77 @@ outputs or stability regress, or if the model fails to start after an image chan
 
 Qwen3.8 thinks before answering, and thinking tokens count toward the output
 limit. Without a cap, long thinking can use the whole limit and leave a truncated
-answer or tool call. llama.cpp's `LLAMA_ARG_THINK_BUDGET` (default **4096**) stops
+answer or tool call. llama.cpp's `LLAMA_ARG_THINK_BUDGET` (default **8192**) stops
 thinking after that many tokens, adds a short note, and makes the model answer.
-With the gateway's 8192-token output limit, at least 4096 tokens remain for the answer.
+With the gateway's 32768-token output limit, at least 24576 tokens remain for the answer.
+
+The budget is a real behavioral limit, not just a length cap. Thinking that is cut
+off mid-analysis is **discarded entirely**: the chat template strips prior thinking
+from history, so reasoning that never reached visible output cannot inform the next
+turn. A model interrupted before it reaches a decision can therefore repeat the same
+truncated analysis and the same unproductive action on every turn. `LLAMA_ARG_THINK_BUDGET_MESSAGE`
+is the only mechanism that converts about-to-be-discarded reasoning into durable
+context, so it asks for a short summary plus one concrete step rather than an
+immediate answer. Keep it to one or two sentences: the model cannot reason about
+it, because thinking is already closed when it is injected.
+
+Keep the budget finite. Unlimited thinking (`-1`) combined with a large output limit
+lets a single turn think for many minutes while producing nothing visible.
 
 Change it without running the workflow (restarts the GPU container; run warmup afterward):
 
 ```powershell
 az containerapp update --name qwen-model --resource-group $rg --set-env-vars LLAMA_ARG_THINK_BUDGET=2048
-# Unlimited thinking:
+# Unlimited thinking (not recommended with a large output limit):
 az containerapp update --name qwen-model --resource-group $rg --set-env-vars LLAMA_ARG_THINK_BUDGET=-1
 ```
 
 The next workflow deployment reapplies the `THINKING_BUDGET_TOKENS` GitHub variable
-(unset means 4096). A request can still set its own `thinking_budget_tokens`.
+(unset means 8192). A request can still set its own `thinking_budget_tokens`.
 
-Output size is bounded by time as well as tokens. Azure Container Apps ends HTTP
-requests at 240 seconds, so the gateway stops each request at 210 seconds,
-including streaming. At roughly 60 tokens per second for one request, 8192 tokens
-plus prompt processing fits; with several requests running at once, each one is
-slower and long responses can still hit the timeout. Lower the thinking budget if
-that happens often.
+Output size is bounded by patience and GPU time rather than by the request timeout,
+because that timeout is idle-based (see [Request timeouts](#request-timeouts)). At
+roughly 60 tokens per second, 8192 thinking tokens is about two minutes before the
+answer begins, and a full 32768-token response is about nine. Concurrent requests
+share the GPU and are slower still. Lower the thinking budget if turnaround matters
+more than depth on hard prompts.
+
+The output limit is a safety rail rather than a target: an answer ends when the model
+stops, so a large limit mainly avoids truncating legitimate long output. Its real cost
+is that a degenerate repetition loop runs to the cap and occupies a slot while doing so.
 
 Match the client's output limit to the gateway's. A client that sends `max_tokens`
-above 8192 gets HTTP 400; in VS Code, set `maxOutputTokens` to 8192 for this model.
+above 32768 gets HTTP 400; in VS Code, set `maxOutputTokens` to 32768 for this model.
+A client that sends a lower value silently keeps its own limit, so leaving it at 8192
+with an 8192 thinking budget would leave nothing for the answer.
+
+### Request timeouts
+
+Container Apps ingress enforces a **240-second idle timeout, not a total duration
+limit**. Measured on this environment with a test app in the same ingress: a request
+that sent nothing was severed at **240.8 seconds** with `HTTP 504 stream timeout`,
+while a request emitting one byte per second **completed normally after 401 seconds**.
+Continuous streaming therefore survives well past 240 seconds; only silence is fatal.
+
+The gateway matches that model with two separate limits:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `UPSTREAM_IDLE_TIMEOUT_MS` | 210000 | Rearmed on every chunk. Must stay below the 240-second ingress limit so the gateway returns a clean `504` instead of ingress severing the connection. Capped at 230000. |
+| `UPSTREAM_TIMEOUT_MS` | 1800000 | Absolute ceiling for a stream that never ends. Capped at 3600000. |
+
+Silence is what counts against the idle limit on both hops (client to gateway, and
+gateway to model over internal ingress). Token generation leaves sub-second gaps and
+never approaches it; the case to watch is **time to first token**, when a long prompt
+is being processed and the upstream is quiet.
+
+**Streaming is required for long answers.** A non-streamed request sends no bytes
+until generation finishes, so the entire generation counts as idle: such a request is
+capped at the idle limit, and at 240 seconds by ingress no matter how the gateway is
+configured. Measured on this deployment: an identical prompt failed with
+`upstream_timeout` at 120 seconds without `stream: true`, and the streamed version
+completed in **265 seconds** with `finish_reason: stop` — past the 240-second mark
+that bounds every non-streamed request.
 
 ## Validation
 

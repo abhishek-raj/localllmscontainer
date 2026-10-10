@@ -134,6 +134,7 @@ export function createGateway(
     res.setHeader("x-request-id", requestId);
     let acquired = false;
     let timeout: NodeJS.Timeout | undefined;
+    let idleTimeout: NodeJS.Timeout | undefined;
     const controller = new AbortController();
     const started = Date.now();
     let timedOut = false;
@@ -201,11 +202,22 @@ export function createGateway(
         body = validateBody(raw, config);
       }
       if (res.destroyed) throw new RequestError(400, "client_disconnected", "Client disconnected");
-      timeout = setTimeout(() => {
+      const expire = () => {
         timedOut = true;
         controller.abort();
-      }, isWarmup ? Math.min(10000, config.upstreamTimeoutMs) : config.upstreamTimeoutMs);
+      };
+      // Rearmed on every chunk, so a long response is bounded by silence rather than by
+      // total duration. Generation that keeps emitting tokens is never interrupted.
+      const armIdle = () => {
+        clearTimeout(idleTimeout);
+        idleTimeout = setTimeout(expire, isWarmup
+          ? Math.min(10000, config.upstreamIdleTimeoutMs)
+          : config.upstreamIdleTimeoutMs);
+        idleTimeout.unref();
+      };
+      timeout = setTimeout(expire, isWarmup ? Math.min(10000, config.upstreamTimeoutMs) : config.upstreamTimeoutMs);
       timeout.unref();
+      armIdle();
       const upstream = await fetch(new URL(isWarmup ? "/health" : req.url!, config.backendUrl), {
         method: isWarmup ? "GET" : "POST",
         headers: {
@@ -245,7 +257,13 @@ export function createGateway(
         "x-content-type-options": "nosniff",
       });
       res.flushHeaders();
-      await pipeline(Readable.from(upstream.body), res, { signal: controller.signal });
+      const ticking = async function* (): AsyncGenerator<Uint8Array> {
+        for await (const chunk of upstream.body!) {
+          armIdle();
+          yield chunk;
+        }
+      };
+      await pipeline(Readable.from(ticking()), res, { signal: controller.signal });
       log({ event: "inference_complete", requestId, status: upstream.status, durationMs: Date.now() - started });
     } catch (error) {
       if (isWarmup && timedOut && !res.destroyed && !res.headersSent) {
@@ -269,6 +287,7 @@ export function createGateway(
       }
     } finally {
       clearTimeout(timeout);
+      clearTimeout(idleTimeout);
       res.off("close", onClose);
       controller.abort();
       if (acquired) active--;

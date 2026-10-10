@@ -124,7 +124,7 @@ jobs:
             throw 'MTP_ENABLED must be true, false, or unset (unset means true)'
           }
           if (-not [string]::IsNullOrWhiteSpace($env:THINKING_BUDGET_TOKENS) -and $env:THINKING_BUDGET_TOKENS -notmatch '^(-1|0|[1-9][0-9]{0,6})$') {
-            throw 'THINKING_BUDGET_TOKENS must be -1 (unlimited), 0, a positive integer, or unset (unset means 4096)'
+            throw 'THINKING_BUDGET_TOKENS must be -1 (unlimited), 0, a positive integer, or unset (unset means 8192)'
           }
           npm ci
           if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
@@ -254,7 +254,7 @@ jobs:
           "Gateway image: $env:GATEWAY_IMAGE" >> $env:GITHUB_STEP_SUMMARY
           "Model image: $env:MODEL_IMAGE" >> $env:GITHUB_STEP_SUMMARY
           "MTP speculative decoding: $(if ($env:MTP_ENABLED -eq 'false') { 'disabled' } else { 'enabled' })" >> $env:GITHUB_STEP_SUMMARY
-          "Thinking budget: $(if ([string]::IsNullOrWhiteSpace($env:THINKING_BUDGET_TOKENS)) { '4096' } else { $env:THINKING_BUDGET_TOKENS }) tokens (-1 = unlimited)" >> $env:GITHUB_STEP_SUMMARY
+          "Thinking budget: $(if ([string]::IsNullOrWhiteSpace($env:THINKING_BUDGET_TOKENS)) { '8192' } else { $env:THINKING_BUDGET_TOKENS }) tokens (-1 = unlimited)" >> $env:GITHUB_STEP_SUMMARY
           "Health, local discovery, and rejected-auth checks passed. No inference request was sent." >> $env:GITHUB_STEP_SUMMARY
       - name: Warm model and verify exact revision health
         if: ${{ !inputs.bootstrap_only }}

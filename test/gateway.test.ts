@@ -306,6 +306,39 @@ test("upstream timeout is explicit and is never automatically retried", async (t
   assert.equal(app.calls(), 1);
 });
 
+test("a steadily streaming response outlives the idle timeout", async (t) => {
+  const app = await setup(t, (_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    let sent = 0;
+    const timer = setInterval(() => {
+      res.write(`data: ${++sent}\n\n`);
+      if (sent === 20) {
+        clearInterval(timer);
+        res.end();
+      }
+    }, 25);
+    res.on("close", () => clearInterval(timer));
+  }, { upstreamIdleTimeoutMs: 400, upstreamTimeoutMs: 60000 });
+  const response = await app.post({ ...payload, stream: true });
+  assert.equal(response.status, 200);
+  // Twenty chunks 25 ms apart run past the 400 ms idle limit without ever idling that long.
+  assert.match(await response.text(), /data: 20/);
+  assert(!app.events.some((event) => event.code === "upstream_timeout"));
+});
+
+test("a stalled stream is cut by the idle timeout, not the total timeout", async (t) => {
+  const app = await setup(t, (_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: partial\n\n");
+  }, { upstreamIdleTimeoutMs: 80, upstreamTimeoutMs: 60000 });
+  const logged = once(app.logEvents, "request_failed");
+  const response = await app.post({ ...payload, stream: true });
+  assert.equal(response.status, 200);
+  await assert.rejects(() => response.text());
+  await logged;
+  assert(app.events.some((event) => event.code === "upstream_timeout"));
+});
+
 test("slow uploads time out without waking the model", async (t) => {
   const app = await setup(t, undefined, { bodyTimeoutMs: 50 });
   const status = await new Promise<number | undefined>((resolve, reject) => {
@@ -358,6 +391,12 @@ test("configuration fails closed on missing, placeholder, weak, and shared keys"
   }
   assert.throws(() => loadConfig({ ...good, MAX_CONCURRENT_REQUESTS: "0" }), /MAX_CONCURRENT_REQUESTS/);
   assert.throws(() => loadConfig({ ...good, MAX_BODY_BYTES: "NaN" }), /MAX_BODY_BYTES/);
+  assert.throws(
+    () => loadConfig({ ...good, UPSTREAM_TIMEOUT_MS: "1000", UPSTREAM_IDLE_TIMEOUT_MS: "2000" }),
+    /UPSTREAM_IDLE_TIMEOUT_MS/,
+  );
+  // Ingress severs a request after 240s of silence, so the idle limit must stay below it.
+  assert.throws(() => loadConfig({ ...good, UPSTREAM_IDLE_TIMEOUT_MS: "240000" }), /UPSTREAM_IDLE_TIMEOUT_MS/);
 });
 
 function warm(app: { url: string }, body = "{}", authorization = `Bearer ${clientKey}`, path = "/warmup") {

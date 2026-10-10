@@ -10,6 +10,7 @@ export interface Config {
   maxOutputTokens: number;
   bodyTimeoutMs: number;
   upstreamTimeoutMs: number;
+  upstreamIdleTimeoutMs: number;
 }
 
 function integer(
@@ -52,6 +53,15 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
   if (!/^[a-zA-Z0-9._-]{1,100}$/.test(modelAlias)) {
     throw new Error("MODEL_ALIAS must be 1-100 letters, digits, dots, underscores, or hyphens");
   }
+  // Container Apps ingress times out a request after 240s of *silence*, not of total
+  // duration, so a steadily streaming response may run far longer. The idle limit stays
+  // below 240s to return a clean 504 instead of letting ingress sever the connection,
+  // while the total limit only guards against a stream that never ends.
+  const upstreamTimeoutMs = integer(env, "UPSTREAM_TIMEOUT_MS", 1_800_000, 3_600_000);
+  const upstreamIdleTimeoutMs = integer(env, "UPSTREAM_IDLE_TIMEOUT_MS", 210_000, 230_000);
+  if (upstreamIdleTimeoutMs > upstreamTimeoutMs) {
+    throw new Error("UPSTREAM_IDLE_TIMEOUT_MS must not exceed UPSTREAM_TIMEOUT_MS");
+  }
   return {
     port: integer(env, "PORT", 8080, 65535),
     backendUrl: url.origin,
@@ -63,6 +73,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     requestsPerMinute: integer(env, "REQUESTS_PER_MINUTE", 30, 10000),
     maxOutputTokens: integer(env, "MAX_OUTPUT_TOKENS", 4096, 32768),
     bodyTimeoutMs: integer(env, "BODY_TIMEOUT_MS", 15000, 60000),
-    upstreamTimeoutMs: integer(env, "UPSTREAM_TIMEOUT_MS", 210000, 230000),
+    upstreamTimeoutMs,
+    upstreamIdleTimeoutMs,
   };
 }
