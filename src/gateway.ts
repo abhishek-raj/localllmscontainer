@@ -143,7 +143,14 @@ export function createGateway(
       res.setHeader("retry-after", "5");
       reply(res, 202, { status: "warming" });
     };
-    const onClose = () => controller.abort();
+    let clientGone = false;
+    // "close" also fires once a response completes normally, so only a premature
+    // close means the client went away; aborting on success would cancel the pipeline.
+    const onClose = () => {
+      if (res.writableFinished) return;
+      clientGone = true;
+      controller.abort();
+    };
     res.once("close", onClose);
     try {
       if (req.method === "GET" && ["/healthz", "/readyz"].includes(req.url ?? "")) {
@@ -269,6 +276,12 @@ export function createGateway(
       if (isWarmup && timedOut && !res.destroyed && !res.headersSent) {
         log({ event: "warmup_pending", requestId, reason: "health_timeout", durationMs: Date.now() - started });
         warming();
+        return;
+      }
+      // A client that hangs up is not an upstream failure and has nothing to receive.
+      // A gateway-initiated timeout also destroys the response, so it must not count here.
+      if (clientGone && !timedOut && !(error instanceof RequestError)) {
+        log({ event: "client_disconnected", requestId, durationMs: Date.now() - started });
         return;
       }
       const failure = error instanceof RequestError ? error

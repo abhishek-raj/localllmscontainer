@@ -601,8 +601,10 @@ failure stopped them.
 - Azure Files, ACR, monitoring, egress, and running replicas can all cost money.
   Budget alerts notify; they do not stop spending. Deactivate model revisions
   or delete the model app when not needed; do not delete unrelated resources.
-- Check gateway structured logs for `request_failed`, `upstream_rejected`, and
-  `inference_complete`; use request IDs, not sensitive prompts, for correlation.
+- Check gateway structured logs for `request_failed`, `upstream_rejected`,
+  `client_disconnected`, and `inference_complete`; use request IDs, not sensitive
+  prompts, for correlation. `client_disconnected` means the caller hung up, which is
+  routine when a coding client cancels a request; it is not a model or gateway fault.
   Inspect llama.cpp and platform logging separately for prompt/privacy exposure.
 
 ### Turning MTP speculative decoding on or off

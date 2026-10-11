@@ -380,6 +380,42 @@ test("client cancellation cancels the backend stream and releases capacity", asy
   assert.equal(app.calls(), 1);
 });
 
+test("a fully delivered stream logs completion instead of a false failure", async (t) => {
+  const app = await setup(t, async (_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    for (const token of ["one", "two", "three"]) {
+      res.write(`data: ${token}\n\n`);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    res.end("data: [DONE]\n\n");
+  });
+  const logged = once(app.logEvents, "inference_complete");
+  const response = await app.post({ ...payload, stream: true });
+  assert.equal(response.status, 200);
+  assert((await response.text()).includes("[DONE]"));
+  await logged;
+  assert.deepEqual(app.events.map((event) => event.event), ["inference_complete"]);
+});
+
+test("client cancellation is logged as a disconnect, not an upstream failure", async (t) => {
+  const app = await setup(t, (_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write("data: first\n\n");
+  });
+  const logged = once(app.logEvents, "client_disconnected");
+  const controller = new AbortController();
+  const response = await fetch(`${app.url}/v1/chat/completions`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${clientKey}`, "content-type": "application/json" },
+    body: JSON.stringify({ ...payload, stream: true }),
+    signal: controller.signal,
+  });
+  assert.equal(response.status, 200);
+  controller.abort();
+  await logged;
+  assert(!app.events.some((event) => event.event === "request_failed"));
+});
+
 test("configuration fails closed on missing, placeholder, weak, and shared keys", () => {
   const good = { BACKEND_URL: "http://model", GATEWAY_API_KEY: clientKey, BACKEND_API_KEY: backendKey };
   assert.throws(() => loadConfig({}), /GATEWAY_API_KEY/);
