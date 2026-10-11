@@ -45,6 +45,8 @@ Coding client --HTTPS/Bearer key--> Public CPU gateway
   [Turning MTP on or off](#turning-mtp-speculative-decoding-on-or-off).
 - Workflow-time model transfer from Hugging Face into Azure Files, using bounded
   4 MiB ranges, exact size/SHA-256 verification, and a verified-file cache.
+- Optional **ingress IP allowlist** and a configurable **VRAM layer limit**, so the
+  deployment can be locked to your own address and made to approximate a smaller GPU.
 
 The 262,144-token context includes input and output and is a shared pool: any one
 request can use all of it, but concurrent requests compete for it. Full-context inference memory
@@ -94,6 +96,50 @@ The gateway listens on all interfaces for container compatibility. For local
 Docker usage, bind only loopback: `-p 127.0.0.1:8080:8080`. Local plain HTTP is for
 loopback development only; Azure ingress is HTTPS-only.
 
+## What this costs
+
+Serverless GPU apps bill per second for **three** meters at once, not just the GPU.
+The container must request the whole workload profile, so the vCPU and memory
+charges are fixed and together cost more than the GPU itself.
+
+Rates below are Azure retail pay-as-you-go for **West US 3 in USD, retrieved
+2026-10-11**, excluding tax. Check
+[Container Apps pricing](https://azure.microsoft.com/pricing/details/container-apps/)
+for your own region and currency.
+
+| Meter | A100 profile (24 vCPU, 220 GiB) | T4 profile (8 vCPU, 56 GiB) |
+| --- | --- | --- |
+| GPU | $1.904/hour | $0.263/hour |
+| vCPU | $2.074/hour | $0.691/hour |
+| Memory | $2.376/hour | $0.605/hour |
+| **While a replica runs** | **$6.35/hour** | **$1.56/hour** |
+
+A replica runs while it serves requests **and** through the 600-second idle
+cooldown that follows. Serverless GPU replicas are always billed at the active
+rate; the reduced idle rate never applies to them. At zero replicas, compute
+costs nothing.
+
+| Usage | A100 | T4 |
+| --- | --- | --- |
+| One 8-hour session, plus one cooldown | about $52 | about $13 |
+| 8 hours a day, 22 days | about $1,140 | about $280 |
+| Three evaluation days | about $156 | about $38 |
+
+Storage and registry continue at roughly **$6 a month** even when nothing runs:
+Azure Files holds the ~17.9 GB of weights at $0.06/GB per month (about $1.07),
+and the Basic registry costs $0.1666 a day (about $5.07). Each subscription also
+gets 180,000 vCPU-seconds, 360,000 GiB-seconds, and 2 million requests free each
+month, which covers roughly the first two hours of vCPU on the A100 profile.
+
+**This is a test-drive tool, not a cheap daily driver.** A few days of evaluation
+costs tens of dollars, a small fraction of any GPU purchase. But 8 hours every
+weekday costs about $1,140 a month on the A100 profile, so a high-end consumer card
+would pay for itself in roughly two months. Cold starts are billed too: every
+wake-up reloads ~17.9 GB from Azure Files before serving.
+
+Costs here are observed and estimated, not a quote. Watch real spend in
+**Cost Management**, and see [Limiting what a stolen key can spend](#limiting-what-a-stolen-key-can-spend).
+
 ## Azure deployment
 
 **Nothing is deployed just by building or testing this project.** The commands
@@ -103,31 +149,80 @@ the deployed environment using the live checks below.
 
 ### Prerequisites
 
-- Existing workload-profiles Container Apps environment and A100 quota.
-- Both ordinary CPU `Consumption` and **Consumption-GPU-NC24-A100** profiles.
-  The template needs the actual *profile name*, not its type. Never use a dedicated
-  NC24-A100 profile if scale-to-zero billing is required.
 - Azure CLI with Bicep and permissions to deploy resources, assign the AcrPull role,
-  build images, and access the file share. Register the Microsoft.App,
-  Microsoft.ContainerRegistry, Microsoft.Storage and Microsoft.ManagedIdentity
-  providers if they are not already registered.
+  build images, and access the file share.
 - An environment dedicated to trusted apps: other apps inside the environment can
   reach the internal model ingress. No public environment HTTP route may target
   the model app. Network isolation of internal ingress is essential; a backend key
   by itself does not prevent direct requests from waking the GPU.
 
-Use a resource group containing the **existing** environment:
+If you already have a workload-profiles environment with a
+**Consumption-GPU-NC24-A100** profile, skip to
+[step 1](#1-bootstrap-registry-and-model-storage). Otherwise start from scratch below.
+The template needs the actual *profile name*, not its type. Never use a dedicated
+NC24-A100 profile if scale-to-zero billing is required.
+
+### 0. Create the environment and GPU profile
+
+Starting from nothing but a subscription:
 
 ```powershell
 az login
 az account set --subscription '<subscription-id>'
+az extension add --name containerapp --upgrade
+
+foreach ($ns in 'Microsoft.App', 'Microsoft.ContainerRegistry', 'Microsoft.Storage', 'Microsoft.ManagedIdentity', 'Microsoft.OperationalInsights') {
+  az provider register --namespace $ns
+}
+```
+
+Registration runs in the background and takes a few minutes. Check it with
+`az provider show --namespace Microsoft.App --query registrationState -o tsv`
+until it reports `Registered`.
+
+Pick a region that offers the GPU you want. A100 and T4 are both available in
+**West US 3**; see
+[serverless GPU regions](https://learn.microsoft.com/azure/container-apps/gpu-serverless-overview#supported-regions)
+for the rest. Create the resource group and a **workload profiles** environment,
+which serverless GPUs require. A Consumption-only environment cannot host them.
+
+```powershell
 $rg = '<resource-group>'
-$env:ACA_ENVIRONMENT = '<existing-environment-name>'
+$env:AZURE_LOCATION = 'westus3'
+$env:ACA_ENVIRONMENT = '<new-environment-name>'
+
+az group create --name $rg --location $env:AZURE_LOCATION
+az containerapp env create --name $env:ACA_ENVIRONMENT --resource-group $rg --location $env:AZURE_LOCATION --enable-workload-profiles
+```
+
+Now confirm GPU quota **before** adding the profile. Pay-as-you-go and enterprise
+agreements usually have A100 and T4 quota already; credit-based subscriptions such
+as Visual Studio or free trials often have none, and a request can take days.
+
+1. Open the environment in the Azure portal and select **Quota**.
+2. Look for **Managed Environment Consumption NCA100 GPUs** (or **T4 GPUs**).
+3. If the quota is zero, request an increase and wait for approval. See
+   [managed environment quota requests](https://learn.microsoft.com/azure/container-apps/quota-requests#submit-a-managed-environment-quota-request).
+
+If the GPU quota is missing from that page entirely, the region or environment type
+does not support serverless GPUs. Once quota exists, add the profile and note its name:
+
+```powershell
+$env:GPU_PROFILE_NAME = 'gpu-a100'
+az containerapp env workload-profile add --name $env:ACA_ENVIRONMENT --resource-group $rg `
+  --workload-profile-name $env:GPU_PROFILE_NAME --workload-profile-type Consumption-GPU-NC24-A100
+az containerapp env workload-profile list --name $env:ACA_ENVIRONMENT --resource-group $rg -o table
+```
+
+Use `Consumption-GPU-NC8as-T4` instead for the cheaper 16 GB card. The listing must
+show both your GPU profile and the default `Consumption` profile; the gateway runs on
+the latter. Adding a profile costs nothing until a replica runs.
+
+Then continue with the resource names used by the rest of this guide:
+
+```powershell
 $env:ACR_NAME = '<globally-unique-registry-name>'
 $storage = '<globallyuniquelowercasestorage>'
-$env:GPU_PROFILE_NAME = '<existing-A100-consumption-profile-name>'
-$env:AZURE_LOCATION = az containerapp env show --name $env:ACA_ENVIRONMENT --resource-group $rg --query location -o tsv
-az containerapp env show --name $env:ACA_ENVIRONMENT --resource-group $rg --query properties.workloadProfiles -o table
 ```
 
 ### 1. Bootstrap registry and model storage
@@ -439,6 +534,8 @@ Add these **environment variables** (not secrets):
 | `MODEL_IMAGE` | `ghcr.io/ggml-org/llama.cpp@sha256:<64-character-digest>` for the CUDA server |
 | `MTP_ENABLED` | Optional. `true` (default when unset) or `false`; the MTP setting each deployment applies |
 | `THINKING_BUDGET_TOKENS` | Optional. Thinking-token cap each deployment applies: `8192` when unset, `-1` for unlimited |
+| `GPU_LAYERS` | Optional. Layers kept in VRAM: `all` when unset, `auto`, or an exact count for smaller-GPU testing |
+| `ALLOWED_CLIENT_IPS` | Optional. Comma-separated CIDR allowlist for the gateway; unset means any address may reach it |
 
 Add these **environment secrets**:
 
@@ -563,7 +660,7 @@ failure stopped them.
 - This architecture protects the GPU from requests **rejected by this gateway**,
   assuming there is no alternate public route. It is not a DDoS protection service.
   Invalid traffic can still run the CPU gateway and generate log/ingress charges.
-  Add gateway IP restrictions for personal use.
+  See [Limiting what a stolen key can spend](#limiting-what-a-stolen-key-can-spend).
 - In-memory limits are per gateway process and reset on restart. They are not
   durable quotas or a hard spending cap. With additional replicas or overlapping
   revisions, aggregate limits increase. A stolen valid key can keep one A100 busy.
@@ -606,6 +703,74 @@ failure stopped them.
   prompts, for correlation. `client_disconnected` means the caller hung up, which is
   routine when a coding client cancels a request; it is not a model or gateway fault.
   Inspect llama.cpp and platform logging separately for prompt/privacy exposure.
+
+### Limiting what a stolen key can spend
+
+`maxReplicas: 1` on the model app is the single most valuable control, but it caps
+the **rate** of spending, not the total. It guarantees only one A100 can ever run, so
+a leaked key cannot scale the GPU out. A key used continuously still costs roughly
+**$6.35 an hour, about $4,600 a month**, and the 600-second cooldown keeps the GPU
+billable for ten minutes after each request. The rate limit of 30 requests a minute
+and three concurrent requests barely slow this down, because one long streaming
+request already keeps the GPU fully busy.
+
+The in-gateway limits cannot act as a spending cap: they live in memory, the gateway
+scales to zero, and every restart resets them. Real limits have to come from Azure.
+
+**An IP allowlist is the strongest control for personal use**, because rejected
+callers never reach the gateway or wake the GPU. Set `ALLOWED_CLIENT_IPS` to a
+comma-separated list of CIDR ranges, as a GitHub variable or before a CLI deployment:
+
+```powershell
+$env:ALLOWED_CLIENT_IPS = "$(Invoke-RestMethod 'https://api.ipify.org')/32"
+```
+
+Any allow rule denies every other address at the ingress. Leaving it unset means
+only the API key stands between the internet and the GPU. Re-run the deployment after
+your home address changes, and remember that GitHub-hosted runners must still reach
+the gateway for smoke checks.
+
+Also worth doing:
+
+- **Set a budget with an alert** in Cost Management. Alerts only notify; to actually
+  stop spending, attach an action group that disables the model app.
+- **Shorten the idle cooldown** if sessions are bursty. Every wake-up pays up to ten
+  idle minutes at the full active rate.
+- **Stop the app when you are done evaluating**:
+  `az containerapp update --name qwen-model --resource-group $rg --min-replicas 0 --max-replicas 0`
+  blocks all inference while keeping the deployment. Set `--max-replicas 1` to resume.
+- **Rotate both keys** on any suspicion of exposure, and check the gateway logs for
+  `inference_complete` entries you did not cause.
+
+### Testing a smaller GPU
+
+The A100 has 80 GB of VRAM, far more than any consumer card, so a model that runs
+here will not necessarily run on hardware you are considering. Two ways to narrow
+the gap:
+
+**Use the T4 profile for a real 16 GB test.** Deploying on
+`Consumption-GPU-NC8as-T4` gives a genuine 16 GB card for about a quarter of the
+price. This is the honest way to check whether a 16 GB consumer GPU suffices, though
+Qwen3.8-27B at 4-bit needs roughly 20 GB and will not fit; point
+[model.json](model.json) at a smaller model first.
+
+**Limit layers kept in VRAM.** `GPU_LAYERS` maps to llama.cpp's
+`LLAMA_ARG_N_GPU_LAYERS`: `all` (default), `auto`, or an exact count. Layers beyond
+that count run on the CPU, so VRAM use falls roughly in proportion.
+
+```powershell
+az containerapp update --name qwen-model --resource-group $rg --set-env-vars LLAMA_ARG_N_GPU_LAYERS=40
+```
+
+Read what the model actually used rather than trusting an estimate. The startup log
+reports each buffer size and the KV cache, and `nvidia-smi` in the portal's
+**Console** tab shows live VRAM for the replica.
+
+Two honest caveats. This lowers VRAM use but does not cap it: nothing stops llama.cpp
+from allocating more, so it answers "how much does this configuration need" rather
+than "what happens on a 12 GB card". And offloaded layers here run on 24 server-class
+cores with 220 GiB of RAM, so the speed you measure will beat a desktop that spills to
+system memory. Treat capacity as representative and speed as an upper bound.
 
 ### Turning MTP speculative decoding on or off
 

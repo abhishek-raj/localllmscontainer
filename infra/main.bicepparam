@@ -16,3 +16,7 @@ param mtpFile = loadJsonContent('../model.json', 'mtp.fileName')
 param mtpEnabled = toLower(readEnvironmentVariable('MTP_ENABLED', 'true')) != 'false'
 // Unset or empty means 4096; the workflow rejects values that aren't integers >= -1.
 param thinkingBudgetTokens = empty(readEnvironmentVariable('THINKING_BUDGET_TOKENS', '')) ? 4096 : int(readEnvironmentVariable('THINKING_BUDGET_TOKENS', '4096'))
+// Unset or empty keeps every layer on the GPU; the workflow rejects other non-numeric values.
+param gpuLayers = empty(readEnvironmentVariable('GPU_LAYERS', '')) ? 'all' : readEnvironmentVariable('GPU_LAYERS', 'all')
+// Comma-separated CIDRs; unset or empty leaves the gateway reachable from any address.
+param allowedClientIpRanges = empty(readEnvironmentVariable('ALLOWED_CLIENT_IPS', '')) ? [] : split(replace(readEnvironmentVariable('ALLOWED_CLIENT_IPS', ''), ' ', ''), ',')

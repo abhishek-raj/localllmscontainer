@@ -44,6 +44,12 @@ param thinkingBudgetTokens int = 8192
 @maxValue(32768)
 param maxOutputTokens int = 32768
 
+@description('Layers kept in VRAM: "all", "auto", or an exact count. Lower counts spill layers to CPU, which approximates a smaller GPU for capacity testing. Flip without a workflow run: az containerapp update --set-env-vars LLAMA_ARG_N_GPU_LAYERS=40 (restarts the model container).')
+param gpuLayers string = 'all'
+
+@description('Optional CIDR allowlist for the public gateway, for example ["203.0.113.4/32"]. Empty means any address may reach the gateway and only the API key stands between the internet and the GPU.')
+param allowedClientIpRanges array = []
+
 @description('Optional unique suffix to create fresh revisions of both apps, including after secret rotation.')
 @maxLength(50)
 param deploymentRevision string = ''
@@ -119,7 +125,7 @@ resource model 'Microsoft.App/containerApps@2025-01-01' = {
           { name: 'LLAMA_ARG_ALIAS', value: modelAlias }
           { name: 'LLAMA_ARG_HOST', value: '0.0.0.0' }
           { name: 'LLAMA_ARG_PORT', value: '8080' }
-          { name: 'LLAMA_ARG_N_GPU_LAYERS', value: 'all' }
+          { name: 'LLAMA_ARG_N_GPU_LAYERS', value: gpuLayers }
           { name: 'LLAMA_ARG_CTX_SIZE', value: string(contextTokens) }
           { name: 'LLAMA_ARG_N_PARALLEL', value: '3' }
           { name: 'LLAMA_ARG_KV_UNIFIED', value: 'true' }
@@ -189,6 +195,13 @@ resource gateway 'Microsoft.App/containerApps@2025-01-01' = {
         targetPort: 8080
         transport: 'http'
         allowInsecure: false
+        // Any Allow rule makes every other address denied at the edge, before the GPU can wake.
+        ipSecurityRestrictions: [for (range, index) in allowedClientIpRanges: {
+          name: 'allowed-${index}'
+          description: 'Operator allowlist'
+          ipAddressRange: range
+          action: 'Allow'
+        }]
       }
     }
     template: {
