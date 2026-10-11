@@ -119,17 +119,31 @@ cooldown that follows. Serverless GPU replicas are always billed at the active
 rate; the reduced idle rate never applies to them. At zero replicas, compute
 costs nothing.
 
-| Usage | A100 | T4 |
-| --- | --- | --- |
-| One 8-hour session, plus one cooldown | about $52 | about $13 |
-| 8 hours a day, 22 days | about $1,140 | about $280 |
-| Three evaluation days | about $156 | about $38 |
+| Usage | A100 | A100 after grant | T4 | T4 after grant |
+| --- | --- | --- | --- | --- |
+| One 8-hour session, plus one cooldown | about $52 | about $46 | about $13 | about $7 |
+| 8 hours a day, 22 days | about $1,140 | about $1,135 | about $280 | about $275 |
+| Three evaluation days | about $156 | about $150 | about $38 | about $33 |
 
 Storage and registry continue at roughly **$6 a month** even when nothing runs:
 Azure Files holds the ~17.9 GB of weights at $0.06/GB per month (about $1.07),
-and the Basic registry costs $0.1666 a day (about $5.07). Each subscription also
-gets 180,000 vCPU-seconds, 360,000 GiB-seconds, and 2 million requests free each
-month, which covers roughly the first two hours of vCPU on the A100 profile.
+and the Basic registry costs $0.1666 a day (about $5.07).
+
+**The free monthly grant may not reach you.** Azure documents a grant per
+subscription per calendar month of 180,000
+vCPU-seconds, 360,000 GiB-seconds, and 2 million requests. GPU-seconds are never
+included, so the grant is worth a flat **$5.40** of compute. That is the
+"after grant" column above. Being a fixed amount, it matters most for short tests:
+it removes over 40% of a single 8-hour T4 session but under 1% of a month of
+daily use. The 2-million-request allowance will never be approached by personal use.
+
+**Treat that column as a best case, not a guarantee.** In this project's own Cost
+Management records, every Container Apps meter was billed at the full retail rate
+from the first second of usage, with no grant deducted — including the first day,
+which stayed well under the vCPU allowance. The grant is also shared across the
+whole subscription, including this project's gateway app and any other Container
+Apps you run, and it resets each calendar month. **Budget with the gross figures**
+and confirm against your own invoice before relying on the reduction.
 
 **This is a test-drive tool, not a cheap daily driver.** A few days of evaluation
 costs tens of dollars, a small fraction of any GPU purchase. But 8 hours every
